@@ -42,12 +42,26 @@ def field(
             aria_label=placeholder,
             variant="soft",
             color="white",
+            background="transparent",
+            border="none",
+            box_shadow="none",
             font_size="1rem",
             flex="1",
             height="100%",
             padding="0",
             _placeholder={"color": "rgba(255, 255, 255, 0.82)"},
-            _focus={"outline": "none"},
+            _focus={
+                "outline": "none",
+                "border": "none",
+                "box_shadow": "none",
+                "background": "transparent",
+            },
+            _focus_visible={
+                "outline": "none",
+                "border": "none",
+                "box_shadow": "none",
+                "background": "transparent",
+            },
         ),
         width="100%",
         height="2.9rem",
@@ -150,7 +164,7 @@ def login_page() -> rx.Component:
                 rx.vstack(
                     rx.heading(
                         "BIPSYSTEM",
-                        font_size="64px",
+                        font_size="54px",
                         color="white",
                         font_family="'Segoe Script', 'Brush Script MT', cursive",
                         font_weight="700",
@@ -164,14 +178,15 @@ def login_page() -> rx.Component:
                         width="min(9rem, 42vw)",
                         height="auto",
                         object_fit="contain",
+                        transform="translateY(-30px)",
                     ),
-                    gap="1.35rem",
+                    gap="65px",
                     align="center",
-                    transform="translateY(-16px)",
+                    transform="translateY(-6px)",
                 ),
                 rx.form(
                     rx.vstack(
-                        field("user-round", "User", "user"),
+                        field("user-round", "Usuário", "user"),
                         field("lock-keyhole", "Senha", "senha", "password"),
                         rx.button(
                             "Login",
@@ -182,7 +197,7 @@ def login_page() -> rx.Component:
                             border_radius="0.25rem",
                             background="white",
                             color="#2B7EFF",
-                            font_size="1.05rem",
+                            font_size="24px",
                             font_weight="700",
                             box_shadow="0 8px 18px rgba(22, 74, 179, 0.16)",
                             transition="transform 160ms ease, box-shadow 160ms ease",
@@ -194,6 +209,7 @@ def login_page() -> rx.Component:
                                 "outline": "3px solid rgba(255, 255, 255, 0.72)",
                                 "outline_offset": "3px",
                             },
+                            transform="translateY(20px)",
                         ),
                         rx.text(
                             LoginState.feedback,
@@ -211,6 +227,7 @@ def login_page() -> rx.Component:
                     on_submit=LoginState.submit,
                     reset_on_submit=False,
                     width="100%",
+                    transform="translateY(40px)",
                 ),
                 position="relative",
                 z_index="1",
@@ -266,6 +283,12 @@ app = rx.App(
         "input::placeholder": {
             "color": "rgba(255, 255, 255, 0.82) !important",
             "opacity": "1 !important",
+        },
+        ".rt-TextFieldRoot:focus-within": {
+            "outline": "none !important",
+            "border": "none !important",
+            "box_shadow": "none !important",
+            "background": "transparent !important",
         },
         "img": {
             "display": "block",

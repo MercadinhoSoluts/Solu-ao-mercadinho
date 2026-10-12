@@ -258,6 +258,294 @@ def login_page() -> rx.Component:
     )
 
 
+TEMPORARY_USER_NAME = "(nome)"
+
+SIDEBAR_ITEMS = (
+    ("Início", "home"),
+    ("Estoque", "inventory"),
+    ("Conferência", "receiving"),
+    ("Produto", "products"),
+    ("Relatórios", "reports"),
+    ("Cadastro", "registration"),
+)
+
+DASHBOARD_CARDS = (
+    {
+        "title": "Estoque",
+        "description": "Verifique o estoque dos produtos",
+        "icon": "package",
+        "color": "#3B82F6",
+        "destination": "inventory",
+    },
+    {
+        "title": "Conferência",
+        "description": "Adicione os produtos recém chegados ao estoque",
+        "icon": "database-zap",
+        "color": "#22C55E",
+        "destination": "receiving",
+    },
+    {
+        "title": "Produto",
+        "description": "Adicione um novo produto ao seu estoque",
+        "icon": "shopping-bag",
+        "color": "#F59E0B",
+        "destination": "products",
+    },
+    {
+        "title": "Relatórios",
+        "description": "Acesse os relatórios das suas atividades",
+        "icon": "chart-no-axes-column",
+        "color": "#EC4899",
+        "destination": "reports",
+    },
+    {
+        "title": "Cadastro",
+        "description": "Cadastre novos funcionários",
+        "icon": "user-plus",
+        "color": "#A3E635",
+        "destination": "registration",
+    },
+)
+
+
+def sidebar_item(label: str, destination: str) -> rx.Component:
+    return rx.vstack(
+        rx.button(
+            rx.hstack(
+                rx.text(label),
+                rx.icon(
+                    "chevron-right",
+                    size=18,
+                    color="white",
+                    stroke_width=2,
+                    aria_hidden="true",
+                ),
+                width="100%",
+                align="center",
+                justify="between",
+            ),
+            type="button",
+            variant="ghost",
+            width="100%",
+            min_width="0",
+            margin="0",
+            box_sizing="border-box",
+            padding="0.72rem 1.15rem",
+            border_radius="0.35rem",
+            color="white",
+            font_size="0.98rem",
+            font_weight="500",
+            cursor="pointer",
+            data_destination=destination,
+            _hover={"background": "rgba(255, 255, 255, 0.16)"},
+            _focus_visible={
+                "outline": "3px solid rgba(255, 255, 255, 0.88)",
+                "outline_offset": "2px",
+            },
+            _active={"background": "rgba(255, 255, 255, 0.24)"},
+        ),
+        rx.box(
+            width="100%",
+            height="1px",
+            background="rgba(255, 255, 255, 0.38)",
+        ),
+        width="100%",
+        gap="0",
+    )
+
+
+def sidebar() -> rx.Component:
+    return rx.box(
+        rx.vstack(
+            rx.button(
+                rx.text(
+                    "Nome",
+                    font_size="1.2rem",
+                    font_weight="700",
+                    color="white",
+                ),
+                type="button",
+                variant="ghost",
+                width="100%",
+                padding="0.65rem 0.75rem 0.9rem",
+                border_radius="0.35rem",
+                color="white",
+                cursor="pointer",
+                data_destination="profile",
+                _hover={"background": "rgba(255, 255, 255, 0.16)"},
+                _focus_visible={
+                    "outline": "3px solid rgba(255, 255, 255, 0.88)",
+                    "outline_offset": "2px",
+                },
+                _active={"background": "rgba(255, 255, 255, 0.24)"},
+            ),
+            rx.vstack(
+                rx.box(
+                    width="100%",
+                    height="1px",
+                    margin="0 0 0.35rem",
+                    background="rgba(255, 255, 255, 0.55)",
+                ),
+                *[sidebar_item(label, destination) for label, destination in SIDEBAR_ITEMS],
+                width="100%",
+                gap="0",
+            ),
+            width="100%",
+            align="stretch",
+        ),
+        width="16rem",
+        min_width="16rem",
+        min_height="100dvh",
+        padding="2.3rem 1.15rem",
+        class_name="dashboard-sidebar",
+        background="#3B82F6",
+        color="white",
+    )
+
+
+def dashboard_header() -> rx.Component:
+    return rx.vstack(
+        rx.heading(
+            f"Olá, {TEMPORARY_USER_NAME}",
+            size="8",
+            color="#172033",
+            font_weight="700",
+            line_height="1.15",
+        ),
+        rx.text(
+            "Aqui está um resumo do seu mercado hoje.",
+            color="#7A8496",
+            font_size="1rem",
+        ),
+        align="start",
+        gap="0.55rem",
+        transform="translateX(-80px)",
+    )
+
+
+def dashboard_card(card: dict[str, str]) -> rx.Component:
+    return rx.button(
+        rx.vstack(
+            rx.box(
+                rx.icon(card["icon"], size=26, color="white", stroke_width=2),
+                display="flex",
+                align_items="center",
+                justify_content="center",
+                width="3.5rem",
+                height="3.5rem",
+                border_radius="50%",
+                background=card["color"],
+            ),
+            rx.text(
+                card["title"],
+                color="#172033",
+                font_size="1.08rem",
+                font_weight="700",
+                text_align="center",
+            ),
+            rx.text(
+                card["description"],
+                color="#7A8496",
+                font_size="0.91rem",
+                line_height="1.45",
+                text_align="center",
+            ),
+            align="center",
+            justify="center",
+            gap="0.85rem",
+            width="100%",
+        ),
+        type="button",
+        variant="ghost",
+        width="100%",
+        min_width="0",
+        height="16rem",
+        min_height="16rem",
+        margin="0",
+        box_sizing="border-box",
+        padding="1.5rem 1.15rem",
+        border_radius="0.7rem",
+        background="white",
+        box_shadow="0 5px 18px rgba(23, 32, 51, 0.08)",
+        cursor="pointer",
+        data_destination=card["destination"],
+        transition="transform 160ms ease, box-shadow 160ms ease",
+        _hover={
+            "transform": "translateY(-3px)",
+            "box_shadow": "0 9px 24px rgba(23, 32, 51, 0.14)",
+        },
+        _focus_visible={
+            "outline": "3px solid #93C5FD",
+            "outline_offset": "3px",
+        },
+        _active={"transform": "translateY(-1px)"},
+    )
+
+
+def dashboard_cards() -> rx.Component:
+    return rx.vstack(
+        rx.box(
+            *[dashboard_card(card) for card in DASHBOARD_CARDS[:3]],
+            width="100%",
+            max_width="62rem",
+            display="grid",
+            grid_template_columns="1fr",
+            class_name="dashboard-card-grid dashboard-card-grid-primary",
+            gap="2.5rem",
+        ),
+        rx.box(
+            *[dashboard_card(card) for card in DASHBOARD_CARDS[3:]],
+            width="100%",
+            max_width="40.25rem",
+            display="grid",
+            grid_template_columns="1fr",
+            class_name="dashboard-card-grid dashboard-card-grid-secondary",
+            gap="5rem",
+        ),
+        width="100%",
+        align="center",
+        gap="2.5rem",
+    )
+
+
+def dashboard() -> rx.Component:
+    return rx.hstack(
+        sidebar(),
+        rx.box(
+            rx.vstack(
+                dashboard_header(),
+                dashboard_cards(),
+                width="100%",
+                max_width="70rem",
+                margin="0 auto",
+                padding="clamp(2rem, 6vh, 4.5rem) clamp(1.25rem, 5vw, 5rem) 6rem",
+                gap="clamp(3rem, 8vh, 5.5rem)",
+                align="stretch",
+            ),
+            rx.image(
+                src="/logo_bipsystem.png",
+                alt="Logo BIPSYSTEM",
+                width="7.5rem",
+                height="auto",
+                position="absolute",
+                right="clamp(1.25rem, 4vw, 4rem)",
+                bottom="1.5rem",
+            ),
+            position="relative",
+            flex="1",
+            min_width="0",
+            min_height="100dvh",
+            overflow="auto",
+            background="#F7F9FC",
+        ),
+        width="100%",
+        min_height="100dvh",
+        align="stretch",
+        gap="0",
+        background="#F7F9FC",
+    )
+
+
 app = rx.App(
     theme=rx.theme(
         appearance="light",
@@ -275,7 +563,7 @@ app = rx.App(
             "overflow": "hidden",
         },
         "body": {
-            "background": "#307CE8",
+            "background": "#F7F9FC",
         },
         "input": {
             "color": "white",
@@ -290,10 +578,42 @@ app = rx.App(
             "box_shadow": "none !important",
             "background": "transparent !important",
         },
+        ".dashboard-card-grid": {
+            "grid_template_columns": "1fr",
+        },
+        "@media (min-width: 640px)": {
+            ".dashboard-card-grid": {
+                "grid_template_columns": "repeat(2, minmax(0, 1fr))",
+            },
+        },
+        "@media (min-width: 1080px)": {
+            ".dashboard-card-grid-primary": {
+                "grid_template_columns": "repeat(3, minmax(0, 1fr))",
+            },
+        },
+        "@media (max-width: 639px)": {
+            ".dashboard-sidebar": {
+                "width": "5.5rem",
+                "min_width": "5.5rem",
+                "padding": "1rem 0.35rem",
+            },
+            ".dashboard-sidebar img": {
+                "width": "4.5rem",
+                "margin_bottom": "0.8rem",
+            },
+            ".dashboard-sidebar button": {
+                "justify_content": "center",
+                "padding": "0.55rem 0.2rem",
+                "font_size": "0.68rem",
+                "line_height": "1.15",
+                "text_align": "center",
+                "white_space": "normal",
+            },
+        },
         "img": {
             "display": "block",
             "max_width": "100%",
         },
     },
 )
-app.add_page(login_page, route="/")
+app.add_page(dashboard, route="/")

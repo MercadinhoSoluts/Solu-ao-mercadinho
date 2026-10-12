@@ -9,6 +9,9 @@ password security itself.
 
 - Add a protected employee-registration capability using the existing native
   Xano `user` authentication table; do not introduce a custom password store.
+- Disable the existing public `POST /auth/signup` after one-time creation of
+  the initial owner account, so new accounts can only be provisioned through
+  authorized employee registration.
 - Define the registration contract for name, email, password, and operational
   role, with server-side validation, normalized unique email, and safe errors.
 - Restrict provisioning to authenticated, authorized users. As a policy

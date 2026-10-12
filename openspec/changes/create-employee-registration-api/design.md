@@ -1,10 +1,19 @@
 ## Context
 
-See `proposal.md` for motivation. The Xano setup guide identifies the native
-`user` authentication table as the source of account credentials and describes
-the roles `operator`, `manager`, and `owner`. The workspace's current API
-endpoints are not yet published, so the design must be validated against the
-actual Xano authentication schema before implementation.
+See `proposal.md` for motivation. The Xano workspace was inspected on branch
+`v1` with the `live` data source selected. The native `user` table has a unique
+index on its normalized email. With the user's approval, the role enum was
+migrated to `operator`, `manager`, and `owner`, `is_active` was added, the
+legacy signup was changed to create only `operator` accounts and require user
+authentication, and authenticated `POST /users` was implemented and
+published. Account ID 2 is the bootstrapped `owner`. Xano Run verified owner and manager provisioning behavior, password boundaries,
+email normalization, duplicate rejection, and special-character names;
+temporary test users were removed. An external anonymous request to the legacy
+signup returned HTTP 401. CORS preflight succeeded but reflected an unrelated
+origin and allowed credentials, so the origin policy needs tightening before
+production. Concurrent duplicate requests, external duplicate/validation status
+mapping, and execution-log redaction remain unverified. The Reflex app still
+lacks an authenticated Xano session.
 
 ## Goals / Non-Goals
 
@@ -27,6 +36,13 @@ actual Xano authentication schema before implementation.
   identity and requires user/role checks in the backend. A public
   `/auth/register` flow would enable uncontrolled self-registration; a private
   provisioning endpoint matches the employee-management use case.
+- **Bootstrap without exposing owner assignment publicly.** The legacy signup
+  creates only an `operator`; account ID 2 was promoted to `owner` in Xano.
+  `POST /auth/signup` now requires native user authentication and was published
+  together with `POST /users`. An external anonymous HTTP request with valid
+  JSON returned `401 Unauthorized`. Its preflight currently reflects an
+  unrelated origin with credentials enabled; restrict allowed origins to the
+  deployed Reflex origin before production.
 - **Create accounts through Xano's native user-authentication mechanism.**
   Confirm the actual native table and available auth functions first, then
   store only the required profile fields (`name`, `role`, and `is_active`) on
@@ -35,10 +51,12 @@ actual Xano authentication schema before implementation.
   the server.** Managers may create operators only; owners may assign any
   supported role. This makes the currently policy-dependent manager permission
   explicit and prevents callers from elevating themselves by supplying a role.
-- **Normalize email before enforcing uniqueness.** Trim and lowercase input,
-  and ensure a database-level uniqueness guarantee or equivalent atomic Xano
-  operation exists. A pre-insert lookup alone is not sufficient for concurrent
-  requests.
+- **Normalize email before enforcing uniqueness.** Trim and lowercase input.
+  The existing unique email index is retained; a pre-insert lookup provides a
+  friendly duplicate response, while the database index remains the final
+  concurrent-write guard. A whitespace-padded email was stored in normalized
+  form, and an uppercase variant was rejected as a duplicate. Concurrent
+  requests and external duplicate/validation status mapping remain unverified.
 - **Enforce password policy before delegating credential storage to native
   Xano auth.** Require at least 12 characters with uppercase, lowercase,
   numeric, and symbol characters. Do not log request passwords; return only
@@ -50,9 +68,9 @@ actual Xano authentication schema before implementation.
 
 ## Risks / Trade-offs
 
-- [Native Xano auth schema or password functions differ from the assumed
-  interface] → Inspect the authorized workspace and test the native create-auth
-  flow in a non-production environment before implementation.
+- [Native Xano password hashing or response-code behavior differs from the
+  assumed interface] → Verify the native `db.add` auth behavior and exact
+  success/conflict HTTP status mapping before publishing.
 - [Concurrent requests can bypass an application-level duplicate lookup] →
   Require a case-insensitive unique constraint or an atomic database-side
   creation operation and verify it with concurrent tests.
@@ -65,15 +83,21 @@ actual Xano authentication schema before implementation.
 
 ## Migration Plan
 
-1. Inspect the native Xano user schema, authentication functions, existing
-   roles, and active-account behavior in the development environment.
-2. Add only missing profile fields and the required normalized-email uniqueness
-   guarantee; preserve existing users and credentials.
-3. Implement and test authorization, validation, duplicate handling, and
-   response shaping in Xano before publishing the endpoint.
-4. Configure Reflex backend-to-Xano access through environment-managed
-   credentials/session forwarding, then integrate the Cadastro form.
-5. If deployment must be rolled back, disable the new endpoint and remove its
+1. [x] Bootstrap the initial account and promote account ID 2 to `owner`.
+2. [x] Set `user authentication` on legacy `POST /auth/signup`.
+   After publication, an external anonymous HTTP request returned `401`.
+3. [x] Verify in Xano Run the owner and manager role paths, manager role limit,
+   weak-password rejection, normalized duplicate behavior, special-character
+   name, exact 12-character password acceptance, and non-credential success
+   response. [ ] Still verify malformed email, all password-class boundaries,
+   concurrent duplicates, external duplicate/validation status codes, and
+   request-history redaction.
+4. [x] Review and publish the two Xano API drafts (`auth/signup` and `users`);
+   Xano reported zero remaining drafts. Temporary test accounts were removed.
+5. Implement Reflex server-side Xano calls after the app has a real
+   authenticated session flow and environment-managed API URL. Keep tokens and
+   caller identity out of browser-controlled inputs.
+6. If deployment must be rolled back, disable the new endpoint and remove its
    Reflex call path. Preserve accounts already created; do not delete users as
    an automatic rollback step.
 

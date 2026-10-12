@@ -12,12 +12,17 @@ Este guia define a configuração do Xano como banco de dados gerenciado e backe
 
 ## Estado atual da integração
 
-- Workspace `169507-0`, instância `x8ki-letl-twmt.n7.xano.io`, plano Free.
-- Tabelas verificadas no workspace: `user` e `event_log` (iniciais do Xano), `categories` e `products`.
-- `categories` contém os campos básicos `name` e `is_active`; `products` tem cadastro básico, preço em centavos, unidade, limite de estoque, perecibilidade e estado ativo. Os campos `category_id` e `created_by` em `products` ainda são inteiros, sem referências formais configuradas; o índice de código de barras também não é único.
-- Tabelas de lote, venda, item de venda, movimentação, caixa e alertas ainda não foram criadas.
-- Os endpoints REST do mercadinho ainda não foram publicados e o repositório ainda não tem aplicação Reflex conectada. Portanto, o banco ainda não está integrado de ponta a ponta ao sistema.
-- As tabelas criadas estão vazias; nenhum dado de teste ou credencial foi adicionado ao workspace.
+- Workspace `169507-0`, instância `x8ki-letl-twmt.n7.xano.io`, plano Free. Inspeção visual confirmada em 12/10/2026 na branch `v1`, com fonte de dados `live`.
+- Tabelas observadas no workspace: `categories`, `codigobarra`, `estoque`, `event_log`, `preco`, `produtos` e `user`. A tabela `produtos` continha 1 registro durante a inspeção; não alterar nem usar esse registro em testes.
+- A tabela nativa `user` tem os campos `created_at`, `name`, `email`, `password`, `role`, `password_reset` e `is_active`. O email possui normalização `trim|lower` e índice B-tree único. Com autorização do usuário, o enum `role` foi migrado para `operator`, `manager` e `owner`, e `is_active` foi adicionado com valor inicial `true`. A conta inicial (ID 2) foi promovida a `owner`.
+- O grupo `Authentication` (#435454) contém `POST /auth/login`, `GET /auth/me` e `POST /auth/signup`. O signup foi alterado para definir sempre `operator` e exige autenticação. Uma chamada HTTP externa sem token, com JSON válido `{}`, retornou `401 Unauthorized` (`ERROR_CODE_UNAUTHORIZED`).
+- `POST /users` foi publicado no grupo `Authentication`, com autenticação nativa `user`, inputs `name`, `email`, `password` e `role`, verificações de estado ativo e papel do solicitante, validação de senha e resposta limitada a `id`, `name`, `email`, `role` e `is_active`. O input de senha está marcado como sensível. No Run do Xano, a criação funcionou para `owner` e `manager` (gestor criando operador); foram rejeitadas senha menor que 12 caracteres, e-mail duplicado e tentativa de gestor criar outro gestor. As respostas verificadas não continham senha.
+- Os grupos `CRUD Produtos` (#436244) e `Event Logs` (#435455) também estão publicados no workspace. Não foram auditados nesta inspeção os contratos dos endpoints desses grupos.
+- Alterações de schema e API acima foram publicadas na branch `v1` com fonte de dados `live`, conforme autorização explícita do usuário. Foram publicados os dois drafts revisados (`auth/signup` e `users`); o Xano confirmou zero drafts pendentes. Os usuários temporários IDs 4, 5, 6 e 7 foram removidos; a conferência posterior mostrou somente a conta real ID 2 na tabela `user`.
+- Testes complementares de `POST /users` no Xano Run: ` teste@mercadinho.com ` foi armazenado como `teste@mercadinho.com`; em seguida, `TESTE@mercadinho.com` foi rejeitado como duplicata. Nome com acento e pontuação (`João d'Ávila #Teste`) e senha de exatamente 12 caracteres foram aceitos. A resposta não expôs senha nem token. O usuário temporário ID 7 foi excluído ao final.
+- Teste HTTP anônimo externo de `POST /auth/signup` com `{}` retornou `401 Unauthorized`, inclusive com `Origin: http://localhost:3000`. O preflight `OPTIONS` retornou `200` e os cabeçalhos incluíram `Access-Control-Allow-Methods: GET, POST, DELETE, PUT, PATCH, OPTIONS, HEAD`, `Access-Control-Allow-Headers: *` e `Access-Control-Allow-Credentials: true`. O servidor refletiu tanto `http://localhost:3000` quanto a origem de teste não confiável `https://example.invalid` em `Access-Control-Allow-Origin`; restringir a lista de origens ao domínio real do Reflex antes de produção.
+- Ainda faltam teste concorrente de duplicidade, casos de e-mail malformado e limites de cada classe de senha, mapeamento HTTP externo de duplicidade/validação e verificação de redação no histórico/logs. A inspeção do código Reflex não encontrou cliente/chamada Xano: o login permanece apenas local, portanto a integração Reflex ainda não está ponta a ponta.
+- O Reflex ainda não está conectado ponta a ponta ao Xano. A aplicação também precisa de fluxo de sessão autenticada antes de uma chamada server-side poder encaminhar a identidade real do usuário.
 
 ## 1. Arquitetura de acesso
 

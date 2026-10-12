@@ -11,7 +11,7 @@ table user {
   
     // The role of the user within their company (e.g., 'admin', 'member').
     enum role? {
-      values = ["admin", "member"]
+      values = ["admin", "caixa"]
     }
   
     object password_reset? {

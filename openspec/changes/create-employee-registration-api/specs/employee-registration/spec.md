@@ -9,7 +9,9 @@ accounts for the mercadinho application through its Xano API.
 
 The system SHALL expose `POST /users` as an authenticated employee-registration
 operation. The JSON request SHALL contain `name`, `email`, `password`, and
-`role`.
+`role`. Once the initial owner account has been bootstrapped, the existing
+`POST /auth/signup` operation SHALL NOT permit unauthenticated account
+creation.
 Authorization SHALL be derived from the authenticated user's stored role, not
 from a role or user identifier supplied as authority by the request. An
 authorized manager SHALL be allowed to create only `operator` accounts. An
@@ -32,6 +34,10 @@ registration.
 
 #### Scenario: Unauthenticated caller attempts registration
 - **WHEN** a caller without a valid authenticated session submits registration data
+- **THEN** the system rejects the request as unauthenticated and creates no account
+
+#### Scenario: Unauthenticated caller uses the legacy signup route after bootstrap
+- **WHEN** a caller without a valid authenticated session submits a request to `POST /auth/signup` after the initial owner account is created
 - **THEN** the system rejects the request as unauthenticated and creates no account
 
 ### Requirement: Registration input is validated by the backend

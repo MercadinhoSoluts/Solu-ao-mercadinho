@@ -260,6 +260,15 @@ def login_page() -> rx.Component:
 
 TEMPORARY_USER_NAME = "(nome)"
 
+ROUTE_BY_DESTINATION = {
+    "home": "/",
+    "inventory": "/estoque",
+    "receiving": "/conferencia",
+    "products": "/produtos",
+    "reports": "/relatorios",
+    "registration": "/cadastro",
+}
+
 SIDEBAR_ITEMS = (
     ("Início", "home"),
     ("Estoque", "inventory"),
@@ -307,42 +316,79 @@ DASHBOARD_CARDS = (
     },
 )
 
+REPORT_CARDS = (
+    {
+        "title": "Data próxima",
+        "description": "Produtos com data de validade próxima",
+        "icon": "calendar-clock",
+        "color": "#FF0004",
+    },
+    {
+        "title": "Estoque baixo",
+        "description": "Produtos que estão com estoque baixo",
+        "icon": "package-x",
+        "color": "#FF0004",
+    },
+    {
+        "title": "Vendas semanais",
+        "description": "Relatório de vendas semanais",
+        "icon": "trending-up",
+        "color": "#77FF80",
+    },
+    {
+        "title": "Vendas diárias",
+        "description": "Relatório de vendas diárias",
+        "icon": "trending-up",
+        "color": "#77FF80",
+    },
+)
 
-def sidebar_item(label: str, destination: str) -> rx.Component:
+
+def sidebar_item(label: str, destination: str, is_active: bool = False) -> rx.Component:
     return rx.vstack(
-        rx.button(
-            rx.hstack(
-                rx.text(label),
-                rx.icon(
-                    "chevron-right",
-                    size=18,
-                    color="white",
-                    stroke_width=2,
-                    aria_hidden="true",
+        rx.link(
+            rx.button(
+                rx.hstack(
+                    rx.text(label),
+                    rx.icon(
+                        "chevron-right",
+                        size=18,
+                        color="white",
+                        stroke_width=2,
+                        aria_hidden="true",
+                    ),
+                    width="100%",
+                    align="center",
+                    justify="between",
                 ),
+                type="button",
+                variant="ghost",
                 width="100%",
-                align="center",
-                justify="between",
+                min_width="0",
+                margin="0",
+                box_sizing="border-box",
+                padding="0.72rem 1.15rem",
+                border_radius="0.35rem",
+                color="white",
+                font_size="0.98rem",
+                font_weight="500",
+                cursor="pointer",
+                background="#2D66D9" if is_active else "transparent",
+                box_shadow="inset 0 0 0 1px rgba(255, 255, 255, 0.12)" if is_active else "none",
+                data_destination=destination,
+                _hover={
+                    "background": "#2D66D9" if is_active else "rgba(255, 255, 255, 0.16)",
+                },
+                _focus_visible={
+                    "outline": "3px solid rgba(255, 255, 255, 0.88)",
+                    "outline_offset": "2px",
+                },
+                _active={"background": "#255CC6" if is_active else "rgba(255, 255, 255, 0.24)"},
             ),
-            type="button",
-            variant="ghost",
+            href=ROUTE_BY_DESTINATION.get(destination, "/"),
             width="100%",
-            min_width="0",
-            margin="0",
-            box_sizing="border-box",
-            padding="0.72rem 1.15rem",
-            border_radius="0.35rem",
-            color="white",
-            font_size="0.98rem",
-            font_weight="500",
-            cursor="pointer",
-            data_destination=destination,
-            _hover={"background": "rgba(255, 255, 255, 0.16)"},
-            _focus_visible={
-                "outline": "3px solid rgba(255, 255, 255, 0.88)",
-                "outline_offset": "2px",
-            },
-            _active={"background": "rgba(255, 255, 255, 0.24)"},
+            display="block",
+            text_decoration="none",
         ),
         rx.box(
             width="100%",
@@ -354,7 +400,7 @@ def sidebar_item(label: str, destination: str) -> rx.Component:
     )
 
 
-def sidebar() -> rx.Component:
+def sidebar(active_destination: str = "home") -> rx.Component:
     return rx.box(
         rx.vstack(
             rx.button(
@@ -386,7 +432,14 @@ def sidebar() -> rx.Component:
                     margin="0 0 0.35rem",
                     background="rgba(255, 255, 255, 0.55)",
                 ),
-                *[sidebar_item(label, destination) for label, destination in SIDEBAR_ITEMS],
+                *[
+                    sidebar_item(
+                        label,
+                        destination,
+                        is_active=(destination == active_destination),
+                    )
+                    for label, destination in SIDEBAR_ITEMS
+                ],
                 width="100%",
                 gap="0",
             ),
@@ -403,7 +456,7 @@ def sidebar() -> rx.Component:
     )
 
 
-def dashboard_header() -> rx.Component:
+def dashboard_header(subtitle: str = "Aqui está um resumo do seu mercado hoje.") -> rx.Component:
     return rx.vstack(
         rx.heading(
             f"Olá, {TEMPORARY_USER_NAME}",
@@ -413,7 +466,7 @@ def dashboard_header() -> rx.Component:
             line_height="1.15",
         ),
         rx.text(
-            "Aqui está um resumo do seu mercado hoje.",
+            subtitle,
             color="#7A8496",
             font_size="1rem",
         ),
@@ -423,8 +476,8 @@ def dashboard_header() -> rx.Component:
     )
 
 
-def dashboard_card(card: dict[str, str]) -> rx.Component:
-    return rx.button(
+def dashboard_card(card: dict[str, str], destination: str | None = None) -> rx.Component:
+    card_button = rx.button(
         rx.vstack(
             rx.box(
                 rx.icon(card["icon"], size=26, color="white", stroke_width=2),
@@ -468,7 +521,7 @@ def dashboard_card(card: dict[str, str]) -> rx.Component:
         background="white",
         box_shadow="0 5px 18px rgba(23, 32, 51, 0.08)",
         cursor="pointer",
-        data_destination=card["destination"],
+        data_destination=destination or "report",
         transition="transform 160ms ease, box-shadow 160ms ease",
         _hover={
             "transform": "translateY(-3px)",
@@ -481,11 +534,25 @@ def dashboard_card(card: dict[str, str]) -> rx.Component:
         _active={"transform": "translateY(-1px)"},
     )
 
+    if destination is None:
+        return card_button
+
+    return rx.link(
+        card_button,
+        href=ROUTE_BY_DESTINATION.get(destination, "/"),
+        width="100%",
+        display="block",
+        text_decoration="none",
+    )
+
 
 def dashboard_cards() -> rx.Component:
     return rx.vstack(
         rx.box(
-            *[dashboard_card(card) for card in DASHBOARD_CARDS[:3]],
+            *[
+                dashboard_card(card, destination=card["destination"])
+                for card in DASHBOARD_CARDS[:3]
+            ],
             width="100%",
             max_width="62rem",
             display="grid",
@@ -494,7 +561,10 @@ def dashboard_cards() -> rx.Component:
             gap="2.5rem",
         ),
         rx.box(
-            *[dashboard_card(card) for card in DASHBOARD_CARDS[3:]],
+            *[
+                dashboard_card(card, destination=card["destination"])
+                for card in DASHBOARD_CARDS[3:]
+            ],
             width="100%",
             max_width="40.25rem",
             display="grid",
@@ -508,13 +578,132 @@ def dashboard_cards() -> rx.Component:
     )
 
 
-def dashboard() -> rx.Component:
+def reports_cards() -> rx.Component:
+    return rx.box(
+        *[dashboard_card(card) for card in REPORT_CARDS],
+        width="100%",
+        max_width="62rem",
+        display="grid",
+        grid_template_columns="1fr",
+        class_name="dashboard-card-grid dashboard-card-grid-reports",
+        gap="2.5rem",
+    )
+
+
+def registration_form_panel() -> rx.Component:
+    input_style = {
+        "width": "100%",
+        "height": "3.1rem",
+        "padding": "0 1rem",
+        "text_align": "center",
+        "border_radius": "0.7rem",
+        "border": "1px solid #E5E7EB",
+        "background": "#D9D9D9",
+        "color": "#000000",
+        "box_shadow": "0 0 0 1px rgba(148, 163, 184, 0.08)",
+        "font_size": "0.98rem",
+        "_placeholder": {"color": "#000000", "opacity": "1", "text_align": "center"},
+        "_focus": {
+            "background": "#D9D9D9",
+            "border_color": "#D9D9D9",
+            "box_shadow": "0 0 0 2px rgba(217, 217, 217, 0.4)",
+            "color": "#000000",
+        },
+        "_focus_visible": {
+            "background": "#D9D9D9",
+            "border_color": "#D9D9D9",
+            "box_shadow": "0 0 0 2px rgba(217, 217, 217, 0.4)",
+            "color": "#000000",
+        },
+        "_hover": {"background": "#D9D9D9"},
+        "_active": {"background": "#D9D9D9"},
+        "_selection": {"background": "rgba(0, 0, 0, 0.2)", "color": "#000000"},
+    }
+
+    return rx.box(
+        rx.vstack(
+            rx.vstack(
+                rx.input(
+                    type="text",
+                    placeholder="Digite o nome do funcionário",
+                    aria_label="Digite o nome do funcionário",
+                    class_name="registration-form-input",
+                    **input_style,
+                ),
+                rx.input(
+                    type="email",
+                    placeholder="Digite o e-mail do funcionário",
+                    aria_label="Digite o e-mail do funcionário",
+                    class_name="registration-form-input",
+                    **input_style,
+                ),
+                rx.input(
+                    type="password",
+                    placeholder="Digite a senha desejada",
+                    aria_label="Digite a senha desejada",
+                    class_name="registration-form-input",
+                    **input_style,
+                ),
+                rx.input(
+                    type="text",
+                    placeholder="Digite a função do funcionário",
+                    aria_label="Digite a função do funcionário",
+                    class_name="registration-form-input",
+                    **input_style,
+                ),
+                rx.button(
+                    "Cadastrar",
+                    type="button",
+                    width="100%",
+                    height="3.2rem",
+                    border_radius="0.7rem",
+                    background="#3B82F6",
+                    color="white",
+                    font_size="0.98rem",
+                    font_weight="700",
+                    box_shadow="0 8px 18px rgba(59, 130, 246, 0.2)",
+                    transition="transform 160ms ease, box-shadow 160ms ease, background 160ms ease",
+                    _hover={
+                        "transform": "translateY(-1px)",
+                        "background": "#2563EB",
+                        "box_shadow": "0 12px 22px rgba(37, 99, 235, 0.28)",
+                    },
+                    _focus_visible={
+                        "outline": "3px solid rgba(147, 197, 253, 0.9)",
+                        "outline_offset": "3px",
+                    },
+                    _active={"transform": "translateY(0)"},
+                ),
+                width="100%",
+                gap="1rem",
+                align="stretch",
+            ),
+            width="100%",
+            max_width="42rem",
+            gap="1.5rem",
+            align="stretch",
+        ),
+        width="100%",
+        max_width="42rem",
+        margin="0 auto",
+        background="white",
+        border_radius="1rem",
+        box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
+        padding="clamp(1.5rem, 3vw, 2.25rem)",
+    )
+
+
+def dashboard_layout(
+    content: rx.Component,
+    active_destination: str = "home",
+    subtitle: str = "Aqui está um resumo do seu mercado hoje.",
+) -> rx.Component:
     return rx.hstack(
-        sidebar(),
+        sidebar(active_destination=active_destination),
         rx.box(
             rx.vstack(
-                dashboard_header(),
-                dashboard_cards(),
+                dashboard_header(subtitle=subtitle),
+                content,
                 width="100%",
                 max_width="70rem",
                 margin="0 auto",
@@ -546,6 +735,96 @@ def dashboard() -> rx.Component:
     )
 
 
+@rx.page(route="/")
+def dashboard() -> rx.Component:
+    return dashboard_layout(
+        dashboard_cards(),
+        active_destination="home",
+        subtitle="Aqui está um resumo do seu mercado hoje.",
+    )
+
+
+@rx.page(route="/cadastro")
+def registration_page() -> rx.Component:
+    return dashboard_layout(
+        registration_form_panel(),
+        active_destination="registration",
+        subtitle="Aqui você pode adicionar funcionários novos ao sistema de gerenciamento do mercado",
+    )
+
+
+@rx.page(route="/estoque")
+def estoque_page() -> rx.Component:
+    return dashboard_layout(
+        rx.box(
+            rx.heading("Estoque", size="7", color="#172033"),
+            rx.text("Tela de estoque em desenvolvimento.", color="#7A8496"),
+            width="100%",
+            max_width="38rem",
+            margin="0 auto",
+            padding="2rem 1.5rem",
+            background="white",
+            border_radius="1rem",
+            box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
+            display="grid",
+            gap="0.85rem",
+        ),
+        active_destination="inventory",
+        subtitle="Acompanhe o estoque do seu mercado.",
+    )
+
+
+@rx.page(route="/conferencia")
+def conferencia_page() -> rx.Component:
+    return dashboard_layout(
+        rx.box(
+            rx.heading("Conferência", size="7", color="#172033"),
+            rx.text("Tela de conferência em desenvolvimento.", color="#7A8496"),
+            width="100%",
+            max_width="38rem",
+            margin="0 auto",
+            padding="2rem 1.5rem",
+            background="white",
+            border_radius="1rem",
+            box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
+            display="grid",
+            gap="0.85rem",
+        ),
+        active_destination="receiving",
+        subtitle="Registre os produtos recém-chegados ao mercado.",
+    )
+
+
+@rx.page(route="/produtos")
+def produtos_page() -> rx.Component:
+    return dashboard_layout(
+        rx.box(
+            rx.heading("Produto", size="7", color="#172033"),
+            rx.text("Tela de produtos em desenvolvimento.", color="#7A8496"),
+            width="100%",
+            max_width="38rem",
+            margin="0 auto",
+            padding="2rem 1.5rem",
+            background="white",
+            border_radius="1rem",
+            box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
+            display="grid",
+            gap="0.85rem",
+        ),
+        active_destination="products",
+        subtitle="Gerencie os produtos do seu mercado.",
+    )
+
+
+@rx.page(route="/relatorios")
+def relatorios_page() -> rx.Component:
+    return dashboard_layout(
+        reports_cards(),
+        active_destination="reports",
+        subtitle="Aqui você pode acessar seus dashboards",
+    )
+
+
 app = rx.App(
     theme=rx.theme(
         appearance="light",
@@ -572,11 +851,24 @@ app = rx.App(
             "color": "rgba(255, 255, 255, 0.82) !important",
             "opacity": "1 !important",
         },
+        ".registration-form-input input": {
+            "color": "#000000 !important",
+        },
+        ".registration-form-input input::placeholder": {
+            "color": "#000000 !important",
+            "opacity": "1 !important",
+        },
         ".rt-TextFieldRoot:focus-within": {
             "outline": "none !important",
             "border": "none !important",
             "box_shadow": "none !important",
             "background": "transparent !important",
+        },
+        ".registration-form-input, .registration-form-input:focus-within": {
+            "background": "#D9D9D9 !important",
+        },
+        ".registration-form-input input, .registration-form-input input:focus": {
+            "background": "#D9D9D9 !important",
         },
         ".dashboard-card-grid": {
             "grid_template_columns": "1fr",
@@ -616,4 +908,3 @@ app = rx.App(
         },
     },
 )
-app.add_page(dashboard, route="/")

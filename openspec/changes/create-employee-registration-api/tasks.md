@@ -1,18 +1,61 @@
-## 1. Xano User Schema
+## 1. Published contract and authorization
 
-- [x] 1.1 Inspect the Xano workspace's native user table, auth-create operation, role fields, and active-account behavior; record the confirmed mapping before changing the schema. Verified the `user` table and signup stack on branch `v1` with the `live` data source; the existing email index is unique.
-- [ ] 1.2 Migrate the `role` enum to `operator`, `manager`, and `owner`, add `is_active`, and verify normalized-email uniqueness without modifying existing accounts. The schema is published and the owner account (ID 2) remains. Whitespace was trimmed and email lowercased; the uppercase variant was rejected as a duplicate. Concurrent requests remain untested.
+- [ ] 1.1 Confirm `POST /users` input names, required fields, method, and path
+      against the currently published Xano API.
+- [ ] 1.2 Confirm success response fields and status code.
+- [ ] 1.3 Confirm validation, duplicate-email, `401`, and `403` response
+      formats/statuses.
+- [ ] 1.4 Confirm the permission matrix for `owner`, `manager`, and
+      `operator`.
+- [ ] 1.5 Confirm the published password policy, including all character-class
+      requirements.
+- [ ] 1.6 Record the contract in the capability specification before coding.
 
-## 2. Employee Registration Endpoint
+## 2. Xano User Schema
 
-- [x] 2.1 Implement authenticated `POST /users` using native Xano authentication and request fields `name`, `email`, `password`, and `role`; owner and manager provisioning paths succeeded in Xano Run. The endpoint was published with a response limited to non-credential fields.
-- [ ] 2.2 Validate required fields, email format/normalization, supported roles, and the 12-character mixed-class password policy; a password shorter than 12 characters was rejected. A 12-character password passed, and email whitespace/case normalization plus an accented/punctuated name were accepted. Required-field, malformed-email, supported-role input, and each password character-class edge case still need explicit tests.
-- [x] 2.3 Enforce owner/manager authorization from the current session, including the manager-only-operator restriction; owner creation succeeded, manager creation of an operator succeeded, manager creation of a manager was denied, and a no-token `POST /users` Run was denied.
-- [ ] 2.4 Shape safe error responses and prevent credential logging or disclosure; the success response excluded password/token fields, the input is marked sensitive, and tested validation errors did not include credentials. Request-history/log redaction still needs verification.
-- [ ] 2.5 Verify duplicate-email behavior, including concurrent requests; an exact duplicate and an uppercase variant of the normalized email were rejected. HTTP status mapping for duplicate/validation failures and concurrent creation remain untested.
-- [x] 2.6 Bootstrap the first account as `operator`, promote that specific account to `owner`, then require authentication on legacy public `POST /auth/signup`; do not publish before verifying public signup is blocked. Account ID 2 is owner; the published signup route was subsequently verified from an external anonymous HTTP request to return `401 Unauthorized`. CORS currently reflects an unrelated origin while allowing credentials and should be restricted before production.
+- [x] 2.1 Inspect the Xano workspace's native user table, auth-create operation, role fields, and active-account behavior; record the confirmed mapping before changing the schema. Verified the `user` table and signup stack on branch `v1` with the `live` data source; the existing email index is unique.
+- [ ] 2.2 Reconcile versioned Xano artifacts with the published configuration without changing the published API as part of this change.
 
-## 3. Reflex Consumption Contract
+## 3. Authentication and session
 
-- [ ] 3.1 Document the request/response contract and configure the Reflex server-side caller to forward the authenticated user session; verify the browser bundle contains no Xano service credential.
-- [ ] 3.2 Exercise the Cadastro-to-Xano flow for success, validation failure, authentication failure, and permission denial; verify the UI presents the created employee or the corresponding safe error.
+- [ ] 3.1 Implement `POST /auth/login` consumption server-side.
+- [ ] 3.2 Implement authenticated `GET /auth/me` consumption server-side.
+- [ ] 3.3 Select and validate a server-side session mechanism for Reflex
+      `0.8.28.post1`.
+- [ ] 3.4 Define refresh, logout, expiration, `401`, and `403` behavior.
+- [ ] 3.5 Add centralized route and operation authorization.
+- [ ] 3.6 Verify no token, password, or privileged credential reaches browser
+      code, URLs, rendered state, or logs.
+
+## 4. Employee Registration Endpoint
+
+- [ ] 4.1 Implement authenticated `POST /users` only after the published
+      contract is confirmed.
+- [ ] 4.2 Validate required fields, email format/normalization, supported
+      roles, and the published password policy.
+- [ ] 4.3 Enforce authorization from the authenticated session, never from
+      browser-supplied authority.
+- [ ] 4.4 Shape safe error responses and prevent credential logging or
+      disclosure.
+- [ ] 4.5 Verify duplicate-email behavior, including concurrent requests.
+
+## 5. Reflex consumption contract
+
+- [ ] 5.1 Preserve the existing Cadastro layout and replace only the
+      function field with a controlled selector.
+- [ ] 5.2 Add loading, duplicate-submit prevention, safe feedback, and
+      success-only form reset.
+- [ ] 5.3 Exercise the Cadastro-to-Xano flow for success, validation failure,
+      authentication failure, and permission denial.
+- [ ] 5.4 Verify the browser bundle contains no Xano service credential.
+
+## 6. Validation
+
+- [ ] 6.1 Test valid and invalid login.
+- [ ] 6.2 Test session restoration, expiration, logout, `401`, and `403`.
+- [ ] 6.3 Test access behavior for `owner`, `manager`, and `operator`.
+- [ ] 6.4 Test valid employee registration and safe handling of API errors.
+- [ ] 6.5 Test duplicate email, invalid email, missing fields, and password
+      policy failures.
+- [ ] 6.6 Test repeated clicks and unexpected responses.
+- [ ] 6.7 Verify passwords and tokens never appear in logs or UI.

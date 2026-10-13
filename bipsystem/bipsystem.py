@@ -1,24 +1,160 @@
+from datetime import datetime, timezone
 from typing import Any
 
 import reflex as rx
 
+from bipsystem.auth_client import (
+    XanoApiError,
+    create_employee,
+    get_current_user,
+    login,
+    normalize_role,
+    validate_password,
+)
 
-class LoginState(rx.State):
-    user: str = ""
-    senha: str = ""
-    feedback: str = ""
+class AuthState(rx.State):
+    authenticated: bool = False
+    user_name: str = "(nome)"
+    user_role: str = ""
+    login_feedback: str = ""
+    registration_feedback: str = ""
+    is_busy: bool = False
+    _auth_token: str = ""
+    _token_expires_at: float = 0.0
 
-    def submit(self, form_data: dict[str, Any]) -> None:
-        user = form_data.get("user", "").strip()
-        senha = form_data.get("senha", "")
-        self.user = user
-        self.senha = senha
+    @staticmethod
+    def _error_message(
+        error: XanoApiError,
+        action: str,
+        authentication: bool = False,
+    ) -> str:
+        if error.status_code in (401, 403):
+            if authentication:
+                return "Senha incorreta. Verifique sua senha e tente novamente."
+            return "Você não tem autorização para realizar esta ação."
+        if error.status_code == 409:
+            return "Este e-mail já está cadastrado."
+        if 400 <= error.status_code < 500:
+            return "Verifique os dados informados e tente novamente."
+        if error.status_code == 0:
+            return "Não foi possível conectar ao Xano."
+        return f"Não foi possível {action}. Tente novamente."
 
-        if not user or not senha:
-            self.feedback = "Preencha usuário e senha para continuar."
+    @staticmethod
+    def get_post_login_redirect(user_role: str | None) -> str | None:
+        if user_role == "operator":
+            return "/caixa"
+        if user_role in {"owner", "manager"}:
+            return "/"
+        return None
+
+    def _clear_session(self) -> None:
+        self.authenticated = False
+        self.user_name = "(nome)"
+        self.user_role = ""
+        self._auth_token = ""
+        self._token_expires_at = 0.0
+
+    def _set_user(self, user: Any) -> None:
+        self.authenticated = True
+        self.user_name = user.name
+        self.user_role = user.role
+
+    async def submit(self, form_data: dict[str, Any]) -> Any:
+        email = str(form_data.get("user", "")).strip()
+        password = str(form_data.get("senha", ""))
+        self.login_feedback = ""
+
+        if not email or not password:
+            self.login_feedback = "Preencha usuário e senha para continuar."
             return
 
-        self.feedback = "Validação local concluída. A autenticação será adicionada posteriormente."
+        self.is_busy = True
+        try:
+            token, _ = await login(email, password)
+            user = await get_current_user(token)
+            if user.is_active is False:
+                self.login_feedback = "Este usuário está inativo."
+                return
+            self._auth_token = token
+            self._token_expires_at = datetime.now(timezone.utc).timestamp() + 86400
+            self._set_user(user)
+            redirect = self.get_post_login_redirect(self.user_role)
+            if redirect is not None:
+                return rx.redirect(redirect)
+            return None
+        except XanoApiError as error:
+            self._clear_session()
+            self.login_feedback = self._error_message(
+                error,
+                "realizar o login",
+                authentication=True,
+            )
+        finally:
+            self.is_busy = False
+
+    async def require_auth(self) -> Any:
+        if not self._auth_token or self._token_expires_at <= datetime.now(timezone.utc).timestamp():
+            self._clear_session()
+            return rx.redirect("/login")
+
+        try:
+            user = await get_current_user(self._auth_token)
+            if user.is_active is False:
+                self._clear_session()
+                return rx.redirect("/login")
+            self._set_user(user)
+        except XanoApiError:
+            self._clear_session()
+            return rx.redirect("/login")
+
+    async def require_admin(self) -> Any:
+        result = await self.require_auth()
+        if result is not None:
+            return result
+        if self.user_role not in {"owner", "manager"}:
+            return rx.redirect("/")
+
+    def logout(self) -> Any:
+        self._clear_session()
+        self.login_feedback = ""
+        self.registration_feedback = ""
+        return rx.redirect("/login")
+
+    async def register_employee(self, form_data: dict[str, Any]) -> None:
+        self.registration_feedback = ""
+        if self.user_role not in {"owner", "manager"}:
+            self.registration_feedback = "Você não tem autorização para cadastrar funcionários."
+            return
+
+        name = str(form_data.get("name", "")).strip()
+        email = str(form_data.get("email", "")).strip()
+        password = str(form_data.get("password", ""))
+        role = normalize_role(str(form_data.get("role", "")))
+
+        if not name or not email or not password or role is None:
+            self.registration_feedback = "Preencha os quatro campos com valores válidos."
+            return
+
+        password_error = validate_password(password)
+        if password_error:
+            self.registration_feedback = password_error
+            return
+
+        if not self._auth_token:
+            self.registration_feedback = "Sua sessão expirou. Faça login novamente."
+            return
+
+        self.is_busy = True
+        try:
+            await create_employee(self._auth_token, name, email, password, role)
+            self.registration_feedback = "Funcionário cadastrado com sucesso."
+        except XanoApiError as error:
+            if error.status_code == 401:
+                self._clear_session()
+            self.registration_feedback = self._error_message(error, "cadastrar o funcionário")
+        finally:
+            self.is_busy = False
 
 
 def field(
@@ -79,6 +215,7 @@ def field(
     )
 
 
+@rx.page(route="/login")
 def login_page() -> rx.Component:
     return rx.box(
         rx.box(
@@ -212,7 +349,7 @@ def login_page() -> rx.Component:
                             transform="translateY(20px)",
                         ),
                         rx.text(
-                            LoginState.feedback,
+                            AuthState.login_feedback,
                             role="status",
                             color="white",
                             font_size="0.82rem",
@@ -224,7 +361,7 @@ def login_page() -> rx.Component:
                         width="100%",
                         gap="0.85rem",
                     ),
-                    on_submit=LoginState.submit,
+                    on_submit=AuthState.submit,
                     reset_on_submit=False,
                     width="100%",
                     transform="translateY(40px)",
@@ -437,12 +574,13 @@ def sidebar(active_destination: str = "home") -> rx.Component:
         rx.vstack(
             rx.button(
                 rx.text(
-                    "Nome",
+                    AuthState.user_name,
                     font_size="1.2rem",
                     font_weight="700",
                     color="white",
                 ),
                 type="button",
+                on_click=AuthState.logout,
                 variant="ghost",
                 width="100%",
                 padding="0.65rem 0.75rem 0.9rem",
@@ -491,7 +629,8 @@ def sidebar(active_destination: str = "home") -> rx.Component:
 def dashboard_header(subtitle: str = "Aqui está um resumo do seu mercado hoje.") -> rx.Component:
     return rx.vstack(
         rx.heading(
-            f"Olá, {TEMPORARY_USER_NAME}",
+            "Olá, ",
+            AuthState.user_name,
             size="8",
             color="#172033",
             font_weight="700",
@@ -622,6 +761,199 @@ def reports_cards() -> rx.Component:
     )
 
 
+def cashier_table_cell(
+    content: str,
+    *,
+    header: bool = False,
+    last: bool = False,
+) -> rx.Component:
+    return rx.box(
+        rx.text(
+            content,
+            color="#172033",
+            font_size="clamp(0.7rem, 1.3vw, 0.92rem)",
+            font_weight="700" if header else "400",
+            line_height="1.25",
+            text_align="center",
+            width="100%",
+        ),
+        padding="0.8rem 0.55rem",
+        min_width="0",
+        min_height="2.9rem",
+        display="flex",
+        align_items="center",
+        justify_content="center",
+        border_right="none" if last else "1px solid #DDE3EC",
+    )
+
+
+def cashier_table() -> rx.Component:
+    columns = ("Nome", "Qnt.", "Código", "Valor Unit.", "Total")
+    empty_rows = [("", "", "", "", "") for _ in range(6)]
+    header = [
+        cashier_table_cell(
+            column,
+            header=True,
+            last=index == len(columns) - 1,
+        )
+        for index, column in enumerate(columns)
+    ]
+    rows = [
+        cashier_table_cell(value, last=index == len(columns) - 1)
+        for row in empty_rows
+        for index, value in enumerate(row)
+    ]
+
+    return rx.box(
+        rx.box(
+            *header,
+            display="grid",
+            grid_template_columns="2fr 0.7fr 1.2fr 1fr 1fr",
+            border_bottom="1px solid #BFC8D6",
+        ),
+        rx.box(
+            *rows,
+            display="grid",
+            grid_template_columns="2fr 0.7fr 1.2fr 1fr 1fr",
+            grid_template_rows="repeat(6, minmax(2.9rem, 1fr))",
+        ),
+        width="100%",
+        overflow_x="auto",
+        border="1px solid #E3E8F0",
+        border_radius="0.65rem",
+    )
+
+
+def cashier_page_content() -> rx.Component:
+    return rx.box(
+        rx.hstack(
+            rx.box(
+                rx.vstack(
+                    rx.image(
+                        src="/logo_bipsystem_branca.png",
+                        alt="Logo BIPSYSTEM",
+                        width="min(13rem, 70%)",
+                        height="auto",
+                    ),
+                    rx.text(
+                        "BIPSYSTEM",
+                        color="white",
+                        font_size="clamp(1.5rem, 3vw, 2.5rem)",
+                        font_weight="800",
+                        letter_spacing="0.08em",
+                        text_align="center",
+                    ),
+                    rx.text(
+                        "Automação Comercial",
+                        color="rgba(255, 255, 255, 0.88)",
+                        font_size="clamp(0.95rem, 1.8vw, 1.15rem)",
+                        text_align="center",
+                    ),
+                    gap="0.7rem",
+                    align="center",
+                ),
+                class_name="cashier-brand",
+                display="flex",
+                align_items="center",
+                justify_content="center",
+                width="28%",
+                min_width="13rem",
+                padding="2rem 1rem",
+            ),
+            rx.box(
+                rx.hstack(
+                    rx.heading(
+                        "BIPSYSTEM",
+                        color="white",
+                        font_family="'Segoe Script', 'Brush Script MT', cursive",
+                        font_size="clamp(2rem, 4vw, 3.1rem)",
+                        font_weight="700",
+                        line_height="1",
+                    ),
+                    rx.text(
+                        "bipsystem.com.br",
+                        color="rgba(255, 255, 255, 0.9)",
+                        font_size="0.9rem",
+                        margin_left="auto",
+                    ),
+                    width="100%",
+                    align="center",
+                    gap="1rem",
+                ),
+                rx.vstack(
+                    rx.box(
+                        rx.hstack(
+                            rx.text(
+                                "Total:",
+                                color="#172033",
+                                font_size="1.1rem",
+                                font_weight="700",
+                            ),
+                            rx.text(
+                                "1234,00 R$",
+                                color="#172033",
+                                font_size="clamp(1.7rem, 4vw, 2.8rem)",
+                                font_weight="800",
+                                margin_left="auto",
+                            ),
+                            width="100%",
+                            align="center",
+                        ),
+                        width="100%",
+                        background="white",
+                        border_radius="0.9rem",
+                        box_shadow="0 8px 22px rgba(23, 32, 51, 0.12)",
+                        padding="1.25rem clamp(1.1rem, 3vw, 2rem)",
+                    ),
+                    rx.box(
+                        rx.vstack(
+                            rx.heading(
+                                "Itens da compra",
+                                color="#172033",
+                                font_size="1.1rem",
+                                font_weight="700",
+                                margin_bottom="0.15rem",
+                            ),
+                            cashier_table(),
+                            width="100%",
+                            align="stretch",
+                            gap="0.9rem",
+                        ),
+                        width="100%",
+                        background="white",
+                        border_radius="0.9rem",
+                        box_shadow="0 8px 22px rgba(23, 32, 51, 0.12)",
+                        padding="clamp(1rem, 2.5vw, 1.6rem)",
+                    ),
+                    width="100%",
+                    gap="1.2rem",
+                    align="stretch",
+                ),
+                class_name="cashier-workspace",
+                width="72%",
+                min_width="0",
+                padding="clamp(1rem, 2vw, 2rem) 0",
+                gap="clamp(1.5rem, 4vw, 3rem)",
+                display="flex",
+                flex_direction="column",
+            ),
+            class_name="cashier-shell",
+            width="100%",
+            max_width="90rem",
+            min_height="calc(100vh - 3rem)",
+            margin="0 auto",
+            align="stretch",
+            gap="clamp(1rem, 3vw, 3rem)",
+        ),
+        class_name="cashier-page",
+        width="100%",
+        min_height="100dvh",
+        padding="1.5rem clamp(1rem, 4vw, 4rem)",
+        background="#307CE8",
+        overflow="auto",
+    )
+
+
 def registration_form_panel() -> rx.Component:
     input_style = {
         "width": "100%",
@@ -654,9 +986,10 @@ def registration_form_panel() -> rx.Component:
 
     return rx.box(
         rx.vstack(
-            rx.vstack(
+            rx.form(
                 rx.input(
                     type="text",
+                    name="name",
                     placeholder="Digite o nome do funcionário",
                     aria_label="Digite o nome do funcionário",
                     class_name="registration-form-input",
@@ -664,6 +997,7 @@ def registration_form_panel() -> rx.Component:
                 ),
                 rx.input(
                     type="email",
+                    name="email",
                     placeholder="Digite o e-mail do funcionário",
                     aria_label="Digite o e-mail do funcionário",
                     class_name="registration-form-input",
@@ -671,21 +1005,24 @@ def registration_form_panel() -> rx.Component:
                 ),
                 rx.input(
                     type="password",
+                    name="password",
                     placeholder="Digite a senha desejada",
                     aria_label="Digite a senha desejada",
                     class_name="registration-form-input",
                     **input_style,
                 ),
-                rx.input(
-                    type="text",
+                rx.select(
+                    ["Proprietário", "Operador", "Admin"],
+                    name="role",
                     placeholder="Digite a função do funcionário",
                     aria_label="Digite a função do funcionário",
                     class_name="registration-form-input",
+                    justify_content="center",
                     **input_style,
                 ),
                 rx.button(
                     "Cadastrar",
-                    type="button",
+                    type="submit",
                     width="100%",
                     height="3.2rem",
                     border_radius="0.7rem",
@@ -706,9 +1043,22 @@ def registration_form_panel() -> rx.Component:
                     },
                     _active={"transform": "translateY(0)"},
                 ),
+                rx.text(
+                    AuthState.registration_feedback,
+                    role="status",
+                    color="#172033",
+                    font_size="0.82rem",
+                    line_height="1.35",
+                    text_align="center",
+                    min_height="1.15rem",
+                ),
                 width="100%",
                 gap="1rem",
                 align="stretch",
+                display="flex",
+                flex_direction="column",
+                on_submit=AuthState.register_employee,
+                reset_on_submit=False,
             ),
             width="100%",
             max_width="42rem",
@@ -1092,7 +1442,7 @@ def dashboard_layout(
     )
 
 
-@rx.page(route="/")
+@rx.page(route="/", on_load=AuthState.require_auth)
 def dashboard() -> rx.Component:
     return dashboard_layout(
         dashboard_cards(),
@@ -1101,7 +1451,7 @@ def dashboard() -> rx.Component:
     )
 
 
-@rx.page(route="/cadastro")
+@rx.page(route="/cadastro", on_load=AuthState.require_admin)
 def registration_page() -> rx.Component:
     return dashboard_layout(
         registration_form_panel(),
@@ -1110,7 +1460,7 @@ def registration_page() -> rx.Component:
     )
 
 
-@rx.page(route="/estoque")
+@rx.page(route="/estoque", on_load=AuthState.require_admin)
 def estoque_page() -> rx.Component:
     return dashboard_layout(
         inventory_panel(),
@@ -1119,7 +1469,7 @@ def estoque_page() -> rx.Component:
     )
 
 
-@rx.page(route="/conferencia")
+@rx.page(route="/conferencia", on_load=AuthState.require_admin)
 def conferencia_page() -> rx.Component:
     return dashboard_layout(
         conference_form_panel(),
@@ -1128,7 +1478,7 @@ def conferencia_page() -> rx.Component:
     )
 
 
-@rx.page(route="/produtos")
+@rx.page(route="/produtos", on_load=AuthState.require_admin)
 def produtos_page() -> rx.Component:
     return dashboard_layout(
         product_form_panel(),
@@ -1137,13 +1487,18 @@ def produtos_page() -> rx.Component:
     )
 
 
-@rx.page(route="/relatorios")
+@rx.page(route="/relatorios", on_load=AuthState.require_admin)
 def relatorios_page() -> rx.Component:
     return dashboard_layout(
         reports_cards(),
         active_destination="reports",
         subtitle="Aqui você pode acessar seus dashboards",
     )
+
+
+@rx.page(route="/caixa", on_load=AuthState.require_auth)
+def caixa_page() -> rx.Component:
+    return cashier_page_content()
 
 
 app = rx.App(
@@ -1252,6 +1607,22 @@ app = rx.App(
                 "line_height": "1.15",
                 "text_align": "center",
                 "white_space": "normal",
+            },
+        },
+        "@media (max-width: 760px)": {
+            ".cashier-shell": {
+                "flex_direction": "column",
+            },
+            ".cashier-brand, .cashier-workspace": {
+                "width": "100%",
+                "min_width": "0",
+            },
+            ".cashier-brand": {
+                "min_height": "12rem",
+                "padding": "1.25rem",
+            },
+            ".cashier-workspace": {
+                "padding_top": "0",
             },
         },
         "img": {

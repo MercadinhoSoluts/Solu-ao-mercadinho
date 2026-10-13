@@ -7,6 +7,10 @@ password security itself.
 
 ## What Changes
 
+- Add a real Reflex login flow backed by `POST /auth/login` and
+  `GET /auth/me`.
+- Define secure session lifecycle, logout, page-refresh behavior, and
+  unauthorized-session handling before exposing administrative operations.
 - Add a protected employee-registration capability using the existing native
   Xano `user` authentication table; do not introduce a custom password store.
 - Disable the existing public `POST /auth/signup` after one-time creation of
@@ -14,9 +18,10 @@ password security itself.
   authorized employee registration.
 - Define the registration contract for name, email, password, and operational
   role, with server-side validation, normalized unique email, and safe errors.
-- Restrict provisioning to authenticated, authorized users. As a policy
-  assumption, an authorized manager may create operators only; the owner may
-  assign any supported role (`operator`, `manager`, or `owner`).
+- Restrict provisioning to authenticated, authorized users. The published
+  authorization matrix for `owner`, `manager`, and `operator` must be confirmed
+  before implementation; the client must never grant authority based on a
+  browser-supplied role.
 - Specify how the Reflex backend consumes the Xano endpoint without exposing
   service credentials to the browser.
 
@@ -39,3 +44,20 @@ None.
   application backend; this proposal does not implement the UI or integration.
 - Documentation: add the API behavior and validation contract to the OpenSpec
   capability specification.
+- Session/authentication: add a server-side token/session strategy compatible
+  with Reflex `0.8.28.post1`, without exposing credentials to browser code.
+
+## Pending contract confirmation
+
+The supplied API URL, login path, `/auth/me` path, and role identifiers are
+inputs to this proposal. Before implementation, confirm against the currently
+published Xano API:
+
+- Exact `POST /users` input names and required fields.
+- Success response shape and HTTP status.
+- Validation, duplicate-email, authentication, and authorization status codes.
+- Permission matrix for each role.
+- Published password policy, including the special-character requirement.
+
+No implementation task may call `POST /users` until these items are recorded
+as confirmed.

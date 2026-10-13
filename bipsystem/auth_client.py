@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from datetime import date
+from math import isfinite
 from typing import Any
 
 import httpx
@@ -35,6 +38,27 @@ class AuthenticatedUser:
     email: str
     role: str
     is_active: bool | None = None
+
+
+def parse_product_weight(value: str) -> int | float | None:
+    try:
+        weight = Decimal(value.strip())
+    except (InvalidOperation, AttributeError):
+        return None
+    if not weight.is_finite():
+        return None
+    if weight == weight.to_integral_value():
+        return int(weight)
+    parsed = float(weight)
+    return parsed if isfinite(parsed) else None
+
+
+def is_valid_product_text(value: str) -> bool:
+    normalized = value.strip()
+    return bool(normalized) and all(
+        character.isalpha() or character == " "
+        for character in normalized
+    )
 
 
 def normalize_role(value: str) -> str | None:
@@ -182,3 +206,162 @@ async def create_employee(
             message="O Xano retornou uma resposta de cadastro incompatível.",
         )
     return payload
+
+
+async def create_product(
+    token: str,
+    tipo: str,
+    marca: str,
+    peso: int | float,
+    codigo_de_barra: str,
+) -> dict[str, Any]:
+    payload = {
+        "tipo": tipo,
+        "marca": marca,
+        "peso": peso,
+        "codigo_de_barra": codigo_de_barra,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{XANO_API_BASE_URL}/produtos",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+            )
+    except httpx.RequestError as error:
+        raise XanoApiError(0, message="Não foi possível conectar ao Xano.") from error
+
+    _raise_for_api_error(response)
+    result = _decode_response(response)
+    if not isinstance(result.get("id"), int):
+        raise XanoApiError(
+            502,
+            message="O Xano não confirmou o cadastro do produto.",
+        )
+    if (
+        result.get("tipo") != tipo
+        or result.get("marca") != marca
+        or result.get("codigo_de_barra") != codigo_de_barra
+    ):
+        raise XanoApiError(
+            502,
+            message="O Xano retornou um produto diferente dos dados enviados.",
+        )
+    try:
+        returned_weight = Decimal(str(result["peso"]))
+    except (KeyError, InvalidOperation, TypeError, ValueError) as error:
+        raise XanoApiError(
+            502,
+            message="O Xano retornou um peso inválido para o produto.",
+        ) from error
+    if returned_weight != Decimal(str(peso)):
+        raise XanoApiError(
+            502,
+            message="O Xano retornou um peso diferente do informado.",
+        )
+    return result
+
+
+def parse_inventory_units(value: str) -> int | None:
+    try:
+        units = int(value.strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return units if units > 0 else None
+
+
+def parse_inventory_date(value: str) -> str | None:
+    try:
+        return date.fromisoformat(value.strip()).isoformat()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+async def list_products(token: str) -> list[dict[str, Any]]:
+    return await _list_xano_records(token, "/produtos")
+
+
+async def list_inventory(token: str) -> list[dict[str, Any]]:
+    return await _list_xano_records(token, "/estoque")
+
+
+async def _list_xano_records(token: str, path: str) -> list[dict[str, Any]]:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{XANO_API_BASE_URL}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except httpx.RequestError as error:
+        raise XanoApiError(0, message="Não foi possível conectar ao Xano.") from error
+
+    _raise_for_api_error(response)
+    payload = response.json()
+    if not isinstance(payload, list) or not all(
+        isinstance(record, dict) for record in payload
+    ):
+        raise XanoApiError(
+            502,
+            message="O Xano retornou uma lista inválida.",
+        )
+    return payload
+
+
+async def create_inventory_lot(
+    token: str,
+    produtos_id: int,
+    unidades: int,
+    validade: str,
+    lote: str,
+) -> dict[str, Any]:
+    return await _mutate_inventory(
+        token,
+        "post",
+        "/estoque",
+        {
+            "produtos_id": produtos_id,
+            "unidades": unidades,
+            "validade": validade,
+            "lote": lote,
+        },
+    )
+
+
+async def update_inventory_lot(
+    token: str,
+    estoque_id: int,
+    unidades: int,
+) -> dict[str, Any]:
+    return await _mutate_inventory(
+        token,
+        "patch",
+        f"/estoque/{estoque_id}",
+        {"unidades": unidades},
+    )
+
+
+async def _mutate_inventory(
+    token: str,
+    method: str,
+    path: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            request = getattr(client, method)
+            response = await request(
+                f"{XANO_API_BASE_URL}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+            )
+    except httpx.RequestError as error:
+        raise XanoApiError(0, message="Não foi possível conectar ao Xano.") from error
+
+    _raise_for_api_error(response)
+    result = _decode_response(response)
+    if not isinstance(result.get("id"), int):
+        raise XanoApiError(
+            502,
+            message="O Xano não confirmou a atualização do estoque.",
+        )
+    return result

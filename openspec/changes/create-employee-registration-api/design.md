@@ -29,6 +29,34 @@ lacks an authenticated Xano session.
 - Add a second user table or put database/service credentials in Reflex or the
   browser.
 
+## Authentication and session design
+
+- Add a real login flow using `POST /auth/login` with `email` and `password`.
+- After login, call `GET /auth/me` with `Authorization: Bearer <authToken>` to
+  obtain the authenticated user and published role.
+- Keep the token in a server-side session mechanism compatible with the
+  installed Reflex version. Do not put it in query parameters, browser
+  `localStorage`, rendered component state, or client-side JavaScript.
+- Define page-refresh restoration, logout, token expiration, and unauthorized
+  response handling before exposing administrative operations.
+- On `401`, clear the session and redirect to login. On `403`, show a safe
+  access-denied state without exposing backend details.
+- Select and validate the concrete Reflex session primitive in a spike before
+  implementation; the repository currently has no session layer.
+
+## Role-based access
+
+The UI may hide navigation items for usability, but authorization must be
+enforced by server-side route and operation handlers and by Xano:
+
+- `owner`: administrative access and employee registration.
+- `manager`: administrative access and employee registration, subject to the
+  published Xano matrix.
+- `operator`: only the published operational/cashier area.
+
+The exact operation matrix remains pending confirmation from the published
+Xano endpoint and must not be inferred from the client.
+
 ## Decisions
 
 - **Use an authenticated `POST /users` operation in the Xano users/auth API
@@ -103,5 +131,11 @@ lacks an authenticated Xano session.
 
 ## Open Questions
 
-None. The current proposal records the role-provisioning policy assumption;
-changing that policy requires an explicit requirements update.
+- What are the exact published input names and required fields for `POST /users`?
+- What are the exact success and error response shapes/statuses?
+- Which employee roles may `owner` and `manager` create?
+- Does the published password policy require all four stated character classes?
+- Which server-side session mechanism is supported by Reflex `0.8.28.post1` in
+  this deployment?
+- Which authorized development credentials/environment can validate the flow
+  without putting secrets in the repository or browser?

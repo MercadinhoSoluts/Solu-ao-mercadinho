@@ -343,6 +343,38 @@ REPORT_CARDS = (
     },
 )
 
+# Dados locais apenas para demonstrar a composição visual da tela de estoque.
+DEMO_INVENTORY = (
+    {
+        "name": "Margarina Qualy c/sal (500g)",
+        "batch": "12345",
+        "quantity": "134",
+        "barcode": "12345677",
+        "expiration": "02/01/27",
+    },
+    {
+        "name": "Margarina Qualy c/sal (250g)",
+        "batch": "12345",
+        "quantity": "134",
+        "barcode": "12345678",
+        "expiration": "02/01/27",
+    },
+    {
+        "name": "Margarina Qualy s/sal (500g)",
+        "batch": "12345",
+        "quantity": "134",
+        "barcode": "12345688",
+        "expiration": "02/01/27",
+    },
+    {
+        "name": "Margarina Qualy s/sal (250g)",
+        "batch": "12345",
+        "quantity": "134",
+        "barcode": "12345679",
+        "expiration": "02/01/27",
+    },
+)
+
 
 def sidebar_item(label: str, destination: str, is_active: bool = False) -> rx.Component:
     return rx.vstack(
@@ -693,6 +725,331 @@ def registration_form_panel() -> rx.Component:
     )
 
 
+def product_form_panel() -> rx.Component:
+    input_style = {
+        "width": "100%",
+        "height": "3.1rem",
+        "padding": "0 1rem",
+        "text_align": "center",
+        "border_radius": "0.7rem",
+        "border": "1px solid #E5E7EB",
+        "background": "#D9D9D9",
+        "color": "#000000",
+        "box_shadow": "0 0 0 1px rgba(148, 163, 184, 0.08)",
+        "font_size": "0.98rem",
+        "_placeholder": {"color": "#000000", "opacity": "1", "text_align": "center"},
+        "_focus": {
+            "background": "#D9D9D9",
+            "border_color": "#D9D9D9",
+            "box_shadow": "0 0 0 2px rgba(217, 217, 217, 0.4)",
+            "color": "#000000",
+        },
+        "_focus_visible": {
+            "background": "#D9D9D9",
+            "border_color": "#D9D9D9",
+            "box_shadow": "0 0 0 2px rgba(217, 217, 217, 0.4)",
+            "color": "#000000",
+        },
+        "_hover": {"background": "#D9D9D9"},
+        "_active": {"background": "#D9D9D9"},
+        "_selection": {"background": "rgba(0, 0, 0, 0.2)", "color": "#000000"},
+    }
+
+    return rx.box(
+        rx.vstack(
+            rx.vstack(
+                rx.input(
+                    type="text",
+                    placeholder="Digite o tipo do produto",
+                    aria_label="Digite o tipo do produto",
+                    class_name="registration-form-input",
+                    **input_style,
+                ),
+                rx.input(
+                    type="text",
+                    placeholder="Digite a marca do produto",
+                    aria_label="Digite a marca do produto",
+                    class_name="registration-form-input",
+                    **input_style,
+                ),
+                rx.input(
+                    type="text",
+                    placeholder="Digite o peso do produto",
+                    aria_label="Digite o peso do produto",
+                    class_name="registration-form-input",
+                    **input_style,
+                ),
+                rx.input(
+                    type="text",
+                    placeholder="Digite o código de barra do produto",
+                    aria_label="Digite o código de barra do produto",
+                    class_name="registration-form-input",
+                    **input_style,
+                ),
+                rx.button(
+                    "Cadastrar",
+                    type="button",
+                    width="100%",
+                    height="3.2rem",
+                    border_radius="0.7rem",
+                    background="#3B82F6",
+                    color="white",
+                    font_size="0.98rem",
+                    font_weight="700",
+                    box_shadow="0 8px 18px rgba(59, 130, 246, 0.2)",
+                    transition="transform 160ms ease, box-shadow 160ms ease, background 160ms ease",
+                    _hover={
+                        "transform": "translateY(-1px)",
+                        "background": "#2563EB",
+                        "box_shadow": "0 12px 22px rgba(37, 99, 235, 0.28)",
+                    },
+                    _focus_visible={
+                        "outline": "3px solid rgba(147, 197, 253, 0.9)",
+                        "outline_offset": "3px",
+                    },
+                    _active={"transform": "translateY(0)"},
+                ),
+                width="100%",
+                gap="1rem",
+                align="stretch",
+            ),
+            width="100%",
+            max_width="42rem",
+            gap="1.5rem",
+            align="stretch",
+        ),
+        width="100%",
+        max_width="42rem",
+        margin="0 auto",
+        background="white",
+        border_radius="1rem",
+        box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
+        padding="clamp(1.5rem, 3vw, 2.25rem)",
+    )
+
+
+def conference_form_panel() -> rx.Component:
+    input_style = {
+        "width": "100%",
+        "height": "3.1rem",
+        "padding": "0 1rem",
+        "text_align": "center",
+        "border_radius": "0.7rem",
+        "border": "1px solid #E5E7EB",
+        "background": "#D9D9D9",
+        "color": "#000000",
+        "box_shadow": "0 0 0 1px rgba(148, 163, 184, 0.08)",
+        "font_size": "0.98rem",
+        "_placeholder": {"color": "#000000", "opacity": "1", "text_align": "center"},
+        "_focus": {
+            "background": "#D9D9D9",
+            "border_color": "#D9D9D9",
+            "box_shadow": "0 0 0 2px rgba(217, 217, 217, 0.4)",
+            "color": "#000000",
+        },
+        "_focus_visible": {
+            "background": "#D9D9D9",
+            "border_color": "#D9D9D9",
+            "box_shadow": "0 0 0 2px rgba(217, 217, 217, 0.4)",
+            "color": "#000000",
+        },
+        "_hover": {"background": "#D9D9D9"},
+        "_active": {"background": "#D9D9D9"},
+        "_selection": {"background": "rgba(0, 0, 0, 0.2)", "color": "#000000"},
+    }
+
+    return rx.box(
+        rx.vstack(
+            rx.vstack(
+                rx.input(
+                    type="text",
+                    placeholder="Código",
+                    aria_label="Código",
+                    class_name="registration-form-input",
+                    **input_style,
+                ),
+                rx.input(
+                    type="text",
+                    placeholder="Lote",
+                    aria_label="Lote",
+                    class_name="registration-form-input",
+                    **input_style,
+                ),
+                rx.input(
+                    type="number",
+                    placeholder="Unidades",
+                    aria_label="Unidades",
+                    class_name="registration-form-input",
+                    **input_style,
+                ),
+                rx.input(
+                    type="date",
+                    placeholder="Validade",
+                    aria_label="Validade",
+                    class_name="registration-form-input conference-date-input",
+                    min="0001-01-01",
+                    max="9999-12-31",
+                    **input_style,
+                ),
+                rx.button(
+                    "Adicionar",
+                    type="button",
+                    width="100%",
+                    height="3.2rem",
+                    border_radius="0.7rem",
+                    background="#3B82F6",
+                    color="white",
+                    font_size="0.98rem",
+                    font_weight="700",
+                    box_shadow="0 8px 18px rgba(59, 130, 246, 0.2)",
+                    transition="transform 160ms ease, box-shadow 160ms ease, background 160ms ease",
+                    _hover={
+                        "transform": "translateY(-1px)",
+                        "background": "#2563EB",
+                        "box_shadow": "0 12px 22px rgba(37, 99, 235, 0.28)",
+                    },
+                    _focus_visible={
+                        "outline": "3px solid rgba(147, 197, 253, 0.9)",
+                        "outline_offset": "3px",
+                    },
+                    _active={"transform": "translateY(0)"},
+                ),
+                width="100%",
+                gap="1rem",
+                align="stretch",
+            ),
+            width="100%",
+            max_width="42rem",
+            gap="1.5rem",
+            align="stretch",
+        ),
+        width="100%",
+        max_width="42rem",
+        margin="0 auto",
+        background="white",
+        border_radius="1rem",
+        box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
+        padding="clamp(1.5rem, 3vw, 2.25rem)",
+    )
+
+
+def inventory_card(product: dict[str, str]) -> rx.Component:
+    columns = (
+        ("Nome", product["name"]),
+        ("Lote", product["batch"]),
+        ("Unid.", product["quantity"]),
+        ("Cod.", product["barcode"]),
+        ("Validade", product["expiration"]),
+    )
+
+    return rx.box(
+        rx.box(
+            *[
+                rx.vstack(
+                    rx.text(
+                        heading,
+                        color="#7A8496",
+                        font_size="0.75rem",
+                        font_weight="600",
+                        line_height="1.2",
+                    ),
+                    rx.text(
+                        value,
+                        color="#172033",
+                        font_size="0.92rem",
+                        line_height="1.35",
+                        white_space="normal" if heading == "Nome" else "nowrap",
+                    ),
+                    align="start",
+                    gap="0.45rem",
+                    min_width="0",
+                    width="100%",
+                )
+                for heading, value in columns
+            ],
+            display="grid",
+            grid_template_columns="minmax(15rem, 2.2fr) repeat(4, minmax(5.5rem, 1fr))",
+            gap="1.25rem",
+            min_width="41rem",
+            width="100%",
+        ),
+        width="100%",
+        overflow_x="auto",
+        padding="1.1rem 1.25rem",
+        background="white",
+        border_radius="0.85rem",
+        box_shadow="0 5px 18px rgba(23, 32, 51, 0.06)",
+        box_sizing="border-box",
+    )
+
+
+def inventory_panel() -> rx.Component:
+    return rx.vstack(
+        rx.box(
+            rx.icon(
+                "search",
+                size=20,
+                color="#000000",
+                stroke_width=2,
+                aria_hidden="true",
+            ),
+            rx.input(
+                placeholder="Buscar produto...",
+                aria_label="Buscar produto por nome, marca, peso, lote ou código de barras",
+                type="text",
+                class_name="inventory-search-input",
+                width="100%",
+                height="100%",
+                padding="0",
+                border="none",
+                outline="none",
+                background="transparent",
+                color="#000000",
+                font_size="0.95rem",
+                _placeholder={"color": "#000000", "opacity": "1"},
+                _focus={
+                    "border": "none",
+                    "outline": "none",
+                    "box_shadow": "none",
+                },
+            ),
+            width="100%",
+            height="3.25rem",
+            padding="0 1rem",
+            gap="0.7rem",
+            display="flex",
+            flex_direction="row",
+            align_items="center",
+            background="white",
+            border="1px solid #E5E7EB",
+            border_radius="0.75rem",
+            box_shadow="0 5px 18px rgba(23, 32, 51, 0.05)",
+            transition="border-color 160ms ease, box-shadow 160ms ease",
+            _focus_within={
+                "border_color": "#93C5FD",
+                "box_shadow": "0 0 0 3px rgba(147, 197, 253, 0.28)",
+            },
+        ),
+        rx.box(
+            *[inventory_card(product) for product in DEMO_INVENTORY],
+            width="100%",
+            display="flex",
+            flex_direction="column",
+            gap="0.85rem",
+            overflow_y="auto",
+            padding="0.15rem 0.35rem 0.5rem 0.15rem",
+            max_height="calc(100dvh - 18rem)",
+            min_height="12rem",
+            scrollbar_width="thin",
+        ),
+        width="100%",
+        max_width="62rem",
+        margin="0 auto",
+        gap="1.15rem",
+        align="stretch",
+    )
+
+
 def dashboard_layout(
     content: rx.Component,
     active_destination: str = "home",
@@ -756,63 +1113,27 @@ def registration_page() -> rx.Component:
 @rx.page(route="/estoque")
 def estoque_page() -> rx.Component:
     return dashboard_layout(
-        rx.box(
-            rx.heading("Estoque", size="7", color="#172033"),
-            rx.text("Tela de estoque em desenvolvimento.", color="#7A8496"),
-            width="100%",
-            max_width="38rem",
-            margin="0 auto",
-            padding="2rem 1.5rem",
-            background="white",
-            border_radius="1rem",
-            box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
-            display="grid",
-            gap="0.85rem",
-        ),
+        inventory_panel(),
         active_destination="inventory",
-        subtitle="Acompanhe o estoque do seu mercado.",
+        subtitle="Aqui está o estoque do mercado",
     )
 
 
 @rx.page(route="/conferencia")
 def conferencia_page() -> rx.Component:
     return dashboard_layout(
-        rx.box(
-            rx.heading("Conferência", size="7", color="#172033"),
-            rx.text("Tela de conferência em desenvolvimento.", color="#7A8496"),
-            width="100%",
-            max_width="38rem",
-            margin="0 auto",
-            padding="2rem 1.5rem",
-            background="white",
-            border_radius="1rem",
-            box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
-            display="grid",
-            gap="0.85rem",
-        ),
+        conference_form_panel(),
         active_destination="receiving",
-        subtitle="Registre os produtos recém-chegados ao mercado.",
+        subtitle="Aqui você pode adicionar produtos recém entregues pelo fornecedor ao seu estoque",
     )
 
 
 @rx.page(route="/produtos")
 def produtos_page() -> rx.Component:
     return dashboard_layout(
-        rx.box(
-            rx.heading("Produto", size="7", color="#172033"),
-            rx.text("Tela de produtos em desenvolvimento.", color="#7A8496"),
-            width="100%",
-            max_width="38rem",
-            margin="0 auto",
-            padding="2rem 1.5rem",
-            background="white",
-            border_radius="1rem",
-            box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
-            display="grid",
-            gap="0.85rem",
-        ),
+        product_form_panel(),
         active_destination="products",
-        subtitle="Gerencie os produtos do seu mercado.",
+        subtitle="Aqui você pode registrar produtos novos ao sistema do mercado",
     )
 
 
@@ -851,6 +1172,13 @@ app = rx.App(
             "color": "rgba(255, 255, 255, 0.82) !important",
             "opacity": "1 !important",
         },
+        ".inventory-search-input, .inventory-search-input:focus, .inventory-search-input input, .inventory-search-input input:focus": {
+            "color": "#000000 !important",
+        },
+        ".inventory-search-input::placeholder, .inventory-search-input input::placeholder": {
+            "color": "#000000 !important",
+            "opacity": "1 !important",
+        },
         ".registration-form-input input": {
             "color": "#000000 !important",
         },
@@ -869,6 +1197,30 @@ app = rx.App(
         },
         ".registration-form-input input, .registration-form-input input:focus": {
             "background": "#D9D9D9 !important",
+        },
+        ".conference-date-input input": {
+            "text_align": "center !important",
+            "text_align_last": "center !important",
+        },
+        ".conference-date-input::-webkit-datetime-edit, .conference-date-input input::-webkit-datetime-edit, .conference-date-input::-webkit-date-and-time-value, .conference-date-input input::-webkit-date-and-time-value": {
+            "display": "flex",
+            "justify_content": "center",
+            "align_items": "center",
+            "text_align": "center !important",
+            "padding": "0",
+            "width": "100%",
+            "margin": "0 auto",
+            "box_sizing": "border-box",
+        },
+        ".conference-date-input::-webkit-datetime-edit-fields-wrapper, .conference-date-input input::-webkit-datetime-edit-fields-wrapper": {
+            "display": "flex",
+            "justify_content": "center",
+            "align_items": "center",
+            "width": "100%",
+            "margin": "0 auto",
+        },
+        ".conference-date-input::-webkit-datetime-edit-text, .conference-date-input input::-webkit-datetime-edit-text, .conference-date-input::-webkit-datetime-edit-month-field, .conference-date-input input::-webkit-datetime-edit-month-field, .conference-date-input::-webkit-datetime-edit-day-field, .conference-date-input input::-webkit-datetime-edit-day-field, .conference-date-input::-webkit-datetime-edit-year-field, .conference-date-input input::-webkit-datetime-edit-year-field": {
+            "text_align": "center",
         },
         ".dashboard-card-grid": {
             "grid_template_columns": "1fr",

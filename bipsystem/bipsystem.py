@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
@@ -5,12 +6,40 @@ import reflex as rx
 
 from bipsystem.auth_client import (
     XanoApiError,
+    create_inventory_lot,
+    create_product,
     create_employee,
     get_current_user,
+    list_inventory,
+    list_products,
+    is_valid_product_text,
     login,
     normalize_role,
+    parse_inventory_date,
+    parse_inventory_units,
+    parse_product_weight,
+    update_inventory_lot,
     validate_password,
 )
+
+INVENTORY_OPERATION_LOCK = asyncio.Lock()
+
+
+def find_inventory_record(
+    inventory: list[dict[str, Any]],
+    product_id: int,
+    validity: str,
+) -> dict[str, Any] | None:
+    return next(
+        (
+            record
+            for record in inventory
+            if record.get("produtos_id") == product_id
+            and str(record.get("validade") or "") == validity
+        ),
+        None,
+    )
+
 
 class AuthState(rx.State):
     authenticated: bool = False
@@ -18,6 +47,16 @@ class AuthState(rx.State):
     user_role: str = ""
     login_feedback: str = ""
     registration_feedback: str = ""
+    product_tipo: str = ""
+    product_marca: str = ""
+    product_peso: str = ""
+    product_codigo_de_barra: str = ""
+    conference_codigo: str = ""
+    conference_lote: str = ""
+    conference_unidades: str = ""
+    conference_validade: str = ""
+    inventory_records: list[dict[str, str]] = []
+    inventory_search: str = ""
     is_busy: bool = False
     _auth_token: str = ""
     _token_expires_at: float = 0.0
@@ -153,6 +192,233 @@ class AuthState(rx.State):
             if error.status_code == 401:
                 self._clear_session()
             self.registration_feedback = self._error_message(error, "cadastrar o funcionário")
+        finally:
+            self.is_busy = False
+
+    def set_product_tipo(self, value: str) -> None:
+        self.product_tipo = value
+
+    def set_product_marca(self, value: str) -> None:
+        self.product_marca = value
+
+    def set_product_peso(self, value: str) -> None:
+        self.product_peso = value
+
+    def set_product_codigo_de_barra(self, value: str) -> None:
+        self.product_codigo_de_barra = value
+
+    def _clear_product_form(self) -> None:
+        self.product_tipo = ""
+        self.product_marca = ""
+        self.product_peso = ""
+        self.product_codigo_de_barra = ""
+
+    async def register_product(self) -> Any:
+        if self.user_role not in {"owner", "manager"}:
+            return rx.toast.error(
+                "Você não tem autorização para cadastrar produtos."
+            )
+        if not self._auth_token:
+            self._clear_session()
+            return rx.redirect("/login")
+
+        tipo = self.product_tipo.strip()
+        marca = self.product_marca.strip()
+        peso_text = self.product_peso.strip()
+        codigo_de_barra = self.product_codigo_de_barra.strip()
+        if not is_valid_product_text(tipo):
+            return rx.toast.error(
+                "Corrija o campo Tipo: use somente letras e espaços."
+            )
+        if not is_valid_product_text(marca):
+            return rx.toast.error(
+                "Corrija o campo Marca: use somente letras e espaços."
+            )
+        if not peso_text or not codigo_de_barra:
+            return rx.toast.error("Preencha os quatro campos para cadastrar o produto.")
+
+        peso = parse_product_weight(peso_text)
+        if peso is None:
+            return rx.toast.error("Informe um peso numérico válido.")
+
+        if self.is_busy:
+            return
+        self.is_busy = True
+        try:
+            await create_product(
+                self._auth_token,
+                tipo,
+                marca,
+                peso,
+                codigo_de_barra,
+            )
+            self._clear_product_form()
+            return rx.toast.success("Produto cadastrado com sucesso.")
+        except XanoApiError as error:
+            if error.status_code == 401:
+                self._clear_session()
+                return rx.redirect("/login")
+            if error.status_code in {400, 409}:
+                if "duplicate" in error.code.lower() or "unique" in error.message.lower():
+                    return rx.toast.error(
+                        "Já existe um produto com este código de barras."
+                    )
+                return rx.toast.error(
+                    "Os dados do produto foram rejeitados pelo Xano."
+                )
+            if error.status_code == 0:
+                return rx.toast.error("Não foi possível conectar ao Xano.")
+            return rx.toast.error(error.message)
+        finally:
+            self.is_busy = False
+
+    def set_conference_codigo(self, value: str) -> None:
+        self.conference_codigo = value
+
+    def set_conference_lote(self, value: str) -> None:
+        self.conference_lote = value
+
+    def set_conference_unidades(self, value: str) -> None:
+        self.conference_unidades = value
+
+    def set_conference_validade(self, value: str) -> None:
+        self.conference_validade = value
+
+    def set_inventory_search(self, value: str) -> None:
+        self.inventory_search = value
+
+    @rx.var
+    def filtered_inventory(self) -> list[dict[str, str]]:
+        query = self.inventory_search.strip().lower()
+        if not query:
+            return self.inventory_records
+        return [
+            record
+            for record in self.inventory_records
+            if query in " ".join(record.values()).lower()
+        ]
+
+    async def require_admin_and_load_inventory(self) -> Any:
+        result = await self.require_admin()
+        if result is not None:
+            return result
+        return await self.load_inventory()
+
+    async def load_inventory(self) -> Any:
+        if not self._auth_token:
+            self._clear_session()
+            return rx.redirect("/login")
+        try:
+            products = await list_products(self._auth_token)
+            inventory = await list_inventory(self._auth_token)
+            products_by_id = {
+                product.get("id"): product
+                for product in products
+                if isinstance(product.get("id"), int)
+            }
+            self.inventory_records = [
+                {
+                    "name": self._inventory_product_name(
+                        products_by_id.get(record.get("produtos_id"))
+                    ),
+                    "batch": str(record.get("lote") or ""),
+                    "quantity": str(record.get("unidades") or ""),
+                    "barcode": str(
+                        products_by_id.get(record.get("produtos_id"), {}).get(
+                            "codigo_de_barra",
+                            "",
+                        )
+                    ),
+                    "expiration": str(record.get("validade") or ""),
+                }
+                for record in inventory
+            ]
+        except XanoApiError as error:
+            if error.status_code == 401:
+                self._clear_session()
+                return rx.redirect("/login")
+            return rx.toast.error(error.message)
+
+    @staticmethod
+    def _inventory_product_name(product: dict[str, Any] | None) -> str:
+        if not product:
+            return "Produto não encontrado"
+        return " ".join(
+            str(product.get(field, "")).strip()
+            for field in ("tipo", "marca", "peso")
+            if str(product.get(field, "")).strip()
+        )
+
+    async def add_inventory(self) -> Any:
+        if self.user_role not in {"owner", "manager"}:
+            return rx.toast.error(
+                "Você não tem autorização para atualizar o estoque."
+            )
+        if self.is_busy:
+            return
+        codigo = self.conference_codigo.strip()
+        lote = self.conference_lote.strip()
+        unidades = parse_inventory_units(self.conference_unidades)
+        validade = parse_inventory_date(self.conference_validade)
+        if not codigo or not lote:
+            return rx.toast.error("Informe o código e o lote do produto.")
+        if unidades is None:
+            return rx.toast.error("Informe uma quantidade inteira maior que zero.")
+        if validade is None:
+            return rx.toast.error("Informe uma data de validade válida.")
+        if not self._auth_token:
+            self._clear_session()
+            return rx.redirect("/login")
+
+        self.is_busy = True
+        try:
+            async with INVENTORY_OPERATION_LOCK:
+                products = await list_products(self._auth_token)
+                product = next(
+                    (
+                        item
+                        for item in products
+                        if item.get("codigo_de_barra") == codigo
+                    ),
+                    None,
+                )
+                if product is None or not isinstance(product.get("id"), int):
+                    return rx.toast.error("Nenhum produto encontrado para este código.")
+
+                inventory = await list_inventory(self._auth_token)
+                existing = find_inventory_record(inventory, product["id"], validade)
+                if existing is not None and isinstance(existing.get("id"), int):
+                    current_units = parse_inventory_units(
+                        str(existing.get("unidades", ""))
+                    )
+                    if current_units is None:
+                        return rx.toast.error(
+                            "O Xano retornou uma quantidade inválida no estoque."
+                        )
+                    await update_inventory_lot(
+                        self._auth_token,
+                        existing["id"],
+                        current_units + unidades,
+                    )
+                else:
+                    await create_inventory_lot(
+                        self._auth_token,
+                        product["id"],
+                        unidades,
+                        validade,
+                        lote,
+                    )
+                self.conference_codigo = ""
+                self.conference_lote = ""
+                self.conference_unidades = ""
+                self.conference_validade = ""
+                await self.load_inventory()
+                return rx.toast.success("Estoque atualizado com sucesso.")
+        except XanoApiError as error:
+            if error.status_code == 401:
+                self._clear_session()
+                return rx.redirect("/login")
+            return rx.toast.error(error.message)
         finally:
             self.is_busy = False
 
@@ -479,39 +745,6 @@ REPORT_CARDS = (
         "color": "#77FF80",
     },
 )
-
-# Dados locais apenas para demonstrar a composição visual da tela de estoque.
-DEMO_INVENTORY = (
-    {
-        "name": "Margarina Qualy c/sal (500g)",
-        "batch": "12345",
-        "quantity": "134",
-        "barcode": "12345677",
-        "expiration": "02/01/27",
-    },
-    {
-        "name": "Margarina Qualy c/sal (250g)",
-        "batch": "12345",
-        "quantity": "134",
-        "barcode": "12345678",
-        "expiration": "02/01/27",
-    },
-    {
-        "name": "Margarina Qualy s/sal (500g)",
-        "batch": "12345",
-        "quantity": "134",
-        "barcode": "12345688",
-        "expiration": "02/01/27",
-    },
-    {
-        "name": "Margarina Qualy s/sal (250g)",
-        "batch": "12345",
-        "quantity": "134",
-        "barcode": "12345679",
-        "expiration": "02/01/27",
-    },
-)
-
 
 def sidebar_item(label: str, destination: str, is_active: bool = False) -> rx.Component:
     return rx.vstack(
@@ -1113,6 +1346,8 @@ def product_form_panel() -> rx.Component:
                     placeholder="Digite o tipo do produto",
                     aria_label="Digite o tipo do produto",
                     class_name="registration-form-input",
+                    value=AuthState.product_tipo,
+                    on_change=AuthState.set_product_tipo,
                     **input_style,
                 ),
                 rx.input(
@@ -1120,6 +1355,8 @@ def product_form_panel() -> rx.Component:
                     placeholder="Digite a marca do produto",
                     aria_label="Digite a marca do produto",
                     class_name="registration-form-input",
+                    value=AuthState.product_marca,
+                    on_change=AuthState.set_product_marca,
                     **input_style,
                 ),
                 rx.input(
@@ -1127,6 +1364,8 @@ def product_form_panel() -> rx.Component:
                     placeholder="Digite o peso do produto",
                     aria_label="Digite o peso do produto",
                     class_name="registration-form-input",
+                    value=AuthState.product_peso,
+                    on_change=AuthState.set_product_peso,
                     **input_style,
                 ),
                 rx.input(
@@ -1134,11 +1373,14 @@ def product_form_panel() -> rx.Component:
                     placeholder="Digite o código de barra do produto",
                     aria_label="Digite o código de barra do produto",
                     class_name="registration-form-input",
+                    value=AuthState.product_codigo_de_barra,
+                    on_change=AuthState.set_product_codigo_de_barra,
                     **input_style,
                 ),
                 rx.button(
                     "Cadastrar",
                     type="button",
+                    on_click=AuthState.register_product,
                     width="100%",
                     height="3.2rem",
                     border_radius="0.7rem",
@@ -1216,6 +1458,8 @@ def conference_form_panel() -> rx.Component:
                     placeholder="Código",
                     aria_label="Código",
                     class_name="registration-form-input",
+                    value=AuthState.conference_codigo,
+                    on_change=AuthState.set_conference_codigo,
                     **input_style,
                 ),
                 rx.input(
@@ -1223,6 +1467,8 @@ def conference_form_panel() -> rx.Component:
                     placeholder="Lote",
                     aria_label="Lote",
                     class_name="registration-form-input",
+                    value=AuthState.conference_lote,
+                    on_change=AuthState.set_conference_lote,
                     **input_style,
                 ),
                 rx.input(
@@ -1230,6 +1476,8 @@ def conference_form_panel() -> rx.Component:
                     placeholder="Unidades",
                     aria_label="Unidades",
                     class_name="registration-form-input",
+                    value=AuthState.conference_unidades,
+                    on_change=AuthState.set_conference_unidades,
                     **input_style,
                 ),
                 rx.input(
@@ -1237,6 +1485,8 @@ def conference_form_panel() -> rx.Component:
                     placeholder="Validade",
                     aria_label="Validade",
                     class_name="registration-form-input conference-date-input",
+                    value=AuthState.conference_validade,
+                    on_change=AuthState.set_conference_validade,
                     min="0001-01-01",
                     max="9999-12-31",
                     **input_style,
@@ -1244,6 +1494,7 @@ def conference_form_panel() -> rx.Component:
                 rx.button(
                     "Adicionar",
                     type="button",
+                    on_click=AuthState.add_inventory,
                     width="100%",
                     height="3.2rem",
                     border_radius="0.7rem",
@@ -1348,6 +1599,8 @@ def inventory_panel() -> rx.Component:
                 aria_label="Buscar produto por nome, marca, peso, lote ou código de barras",
                 type="text",
                 class_name="inventory-search-input",
+                value=AuthState.inventory_search,
+                on_change=AuthState.set_inventory_search,
                 width="100%",
                 height="100%",
                 padding="0",
@@ -1381,7 +1634,7 @@ def inventory_panel() -> rx.Component:
             },
         ),
         rx.box(
-            *[inventory_card(product) for product in DEMO_INVENTORY],
+            rx.foreach(AuthState.filtered_inventory, inventory_card),
             width="100%",
             display="flex",
             flex_direction="column",
@@ -1460,7 +1713,7 @@ def registration_page() -> rx.Component:
     )
 
 
-@rx.page(route="/estoque", on_load=AuthState.require_admin)
+@rx.page(route="/estoque", on_load=AuthState.require_admin_and_load_inventory)
 def estoque_page() -> rx.Component:
     return dashboard_layout(
         inventory_panel(),

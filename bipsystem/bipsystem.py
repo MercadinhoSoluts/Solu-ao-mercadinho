@@ -343,11 +343,15 @@ class AuthState(rx.State):
     def _inventory_product_name(product: dict[str, Any] | None) -> str:
         if not product:
             return "Produto não encontrado"
-        return " ".join(
+        product_name = [
             str(product.get(field, "")).strip()
-            for field in ("tipo", "marca", "peso")
+            for field in ("tipo", "marca")
             if str(product.get(field, "")).strip()
-        )
+        ]
+        weight = str(product.get("peso", "")).strip()
+        if weight:
+            product_name.append(f"{weight} g")
+        return " ".join(product_name)
 
     async def add_inventory(self) -> Any:
         if self.user_role not in {"owner", "manager"}:
@@ -1374,8 +1378,8 @@ def product_form_panel() -> rx.Component:
                 ),
                 rx.input(
                     type="text",
-                    placeholder="Digite o peso do produto",
-                    aria_label="Digite o peso do produto",
+                    placeholder="Digite o peso do produto (g)",
+                    aria_label="Digite o peso do produto (g)",
                     class_name="registration-form-input",
                     value=AuthState.product_peso,
                     on_change=AuthState.set_product_peso,
@@ -1588,7 +1592,7 @@ def inventory_card(product: dict[str, str]) -> rx.Component:
             width="100%",
         ),
         width="100%",
-        overflow_x="auto",
+        overflow="visible",
         padding="1.1rem 1.25rem",
         background="white",
         border_radius="0.85rem",
@@ -1653,6 +1657,7 @@ def inventory_panel() -> rx.Component:
             flex_direction="column",
             gap="0.85rem",
             overflow_y="auto",
+            overflow_x="visible",
             padding="0.15rem 0.35rem 0.5rem 0.15rem",
             max_height="calc(100dvh - 18rem)",
             min_height="12rem",

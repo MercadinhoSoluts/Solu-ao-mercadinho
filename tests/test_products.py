@@ -190,6 +190,28 @@ class InventoryBusinessRuleTests(unittest.TestCase):
         record = find_inventory_record(self.INVENTORY, 2, "2027-12-20")
         self.assertEqual(record["id"], 20)
 
+    def test_inventory_product_name_displays_registered_weight_in_grams(self) -> None:
+        self.assertEqual(
+            AuthState._inventory_product_name(
+                {"tipo": "Leite", "marca": "Marca", "peso": 500}
+            ),
+            "Leite Marca 500 g",
+        )
+
+    def test_inventory_product_name_keeps_weight_specific_to_each_product(self) -> None:
+        self.assertEqual(
+            AuthState._inventory_product_name(
+                {"tipo": "Arroz", "marca": "Marca A", "peso": 250}
+            ),
+            "Arroz Marca A 250 g",
+        )
+        self.assertEqual(
+            AuthState._inventory_product_name(
+                {"tipo": "Feijão", "marca": "Marca B", "peso": 1000}
+            ),
+            "Feijão Marca B 1000 g",
+        )
+
 
 class InventoryStateIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_different_lot_updates_existing_record_without_creating_one(self) -> None:

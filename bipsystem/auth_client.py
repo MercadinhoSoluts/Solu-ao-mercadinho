@@ -16,6 +16,12 @@ XANO_API_BASE_URL = os.environ.get(
     DEFAULT_XANO_API_BASE_URL,
 ).rstrip("/")
 SUPPORTED_ROLES = {"owner", "manager", "operator"}
+ROLE_ALIASES = {
+    "admin": "manager",
+    "administrador": "manager",
+    "proprietario": "owner",
+    "proprietário": "owner",
+}
 ROLE_LABELS = {
     "Proprietário": "owner",
     "Operador": "operator",
@@ -65,6 +71,9 @@ def normalize_role(value: str) -> str | None:
     role = value.strip()
     if role in ROLE_LABELS:
         return ROLE_LABELS[role]
+    alias = ROLE_ALIASES.get(role.casefold())
+    if alias is not None:
+        return alias
     if role in SUPPORTED_ROLES:
         return role
     return None
@@ -124,7 +133,8 @@ def _parse_user(payload: dict[str, Any]) -> AuthenticatedUser:
             message="O Xano retornou dados de usuário incompletos.",
         ) from error
 
-    if role not in SUPPORTED_ROLES:
+    normalized_role = normalize_role(role)
+    if normalized_role is None:
         raise XanoApiError(
             502,
             message="O Xano retornou uma função de usuário não reconhecida.",
@@ -137,7 +147,7 @@ def _parse_user(payload: dict[str, Any]) -> AuthenticatedUser:
             message="O Xano retornou um estado de usuário inválido.",
         )
 
-    return AuthenticatedUser(user_id, name, email, role, is_active)
+    return AuthenticatedUser(user_id, name, email, normalized_role, is_active)
 
 
 async def login(email: str, password: str) -> tuple[str, int]:
@@ -206,6 +216,73 @@ async def create_employee(
             message="O Xano retornou uma resposta de cadastro incompatível.",
         )
     return payload
+
+
+async def list_employees(token: str) -> list[dict[str, Any]]:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{XANO_API_BASE_URL}/users",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except httpx.RequestError as error:
+        raise XanoApiError(0, message="Não foi possível consultar os funcionários.") from error
+
+    _raise_for_api_error(response)
+    payload = response.json()
+    if not isinstance(payload, list) or not all(
+        isinstance(record, dict) for record in payload
+    ):
+        raise XanoApiError(
+            502,
+            message="O Xano retornou uma lista de funcionários inválida.",
+        )
+    return payload
+
+
+async def update_employee(
+    token: str,
+    employee_id: int,
+    name: str,
+    email: str,
+    role: str,
+    password: str = "",
+) -> dict[str, Any]:
+    payload: dict[str, str] = {"name": name, "email": email, "role": role}
+    if password:
+        payload["password"] = password
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.patch(
+                f"{XANO_API_BASE_URL}/users/{employee_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+            )
+    except httpx.RequestError as error:
+        raise XanoApiError(0, message="Não foi possível atualizar o funcionário.") from error
+
+    _raise_for_api_error(response)
+    result = _decode_response(response)
+    if result.get("id") != employee_id:
+        raise XanoApiError(
+            502,
+            message="O Xano não confirmou a atualização do funcionário.",
+        )
+    return result
+
+
+async def delete_employee(token: str, employee_id: int) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.delete(
+                f"{XANO_API_BASE_URL}/users/{employee_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except httpx.RequestError as error:
+        raise XanoApiError(0, message="Não foi possível excluir o funcionário.") from error
+
+    _raise_for_api_error(response)
 
 
 async def create_product(

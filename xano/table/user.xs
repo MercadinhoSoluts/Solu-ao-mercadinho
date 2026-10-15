@@ -9,10 +9,11 @@ table user {
     email? email filters=trim|lower
     password? password filters=min:8|minAlpha:1|minDigit:1
   
-    // The role of the user within their company (e.g., 'admin', 'member').
+    // The role of the user within their company.
     enum role? {
-      values = ["admin", "caixa"]
+      values = ["operator", "manager", "owner"]
     }
+    bool is_active?=true
   
     object password_reset? {
       schema {

@@ -9,7 +9,9 @@ from bipsystem.auth_client import (
     create_inventory_lot,
     create_product,
     create_employee,
+    delete_employee,
     get_current_user,
+    list_employees,
     list_inventory,
     list_products,
     is_valid_product_text,
@@ -20,6 +22,7 @@ from bipsystem.auth_client import (
     parse_product_weight,
     update_inventory_lot,
     validate_password,
+    update_employee,
 )
 
 INVENTORY_OPERATION_LOCK = asyncio.Lock()
@@ -47,6 +50,16 @@ class AuthState(rx.State):
     user_role: str = ""
     login_feedback: str = ""
     registration_feedback: str = ""
+    employees: list[dict[str, Any]] = []
+    employee_search: str = ""
+    employee_editing_id: int = 0
+    employee_delete_id: int = 0
+    employee_delete_name: str = ""
+    employee_delete_open: bool = False
+    employee_form_name: str = ""
+    employee_form_email: str = ""
+    employee_form_role: str = ""
+    employee_form_password: str = ""
     product_tipo: str = ""
     product_marca: str = ""
     product_peso: str = ""
@@ -154,6 +167,12 @@ class AuthState(rx.State):
         if self.user_role not in {"owner", "manager"}:
             return rx.redirect("/")
 
+    async def require_admin_and_load_employees(self) -> Any:
+        result = await self.require_admin()
+        if result is not None:
+            return result
+        await self.load_employees()
+
     def logout(self) -> Any:
         self._clear_session()
         self.login_feedback = ""
@@ -192,6 +211,165 @@ class AuthState(rx.State):
             if error.status_code == 401:
                 self._clear_session()
             self.registration_feedback = self._error_message(error, "cadastrar o funcionário")
+        finally:
+            self.is_busy = False
+
+    async def submit_employee_form(self, form_data: dict[str, Any]) -> None:
+        self.employee_form_name = str(form_data.get("name", ""))
+        self.employee_form_email = str(form_data.get("email", ""))
+        self.employee_form_role = str(form_data.get("role", ""))
+        self.employee_form_password = str(form_data.get("password", ""))
+        if self.employee_editing_id:
+            await self.save_employee()
+            return
+        await self.register_employee(form_data)
+        if self.registration_feedback == "Funcionário cadastrado com sucesso.":
+            await self.load_employees()
+            self.employee_form_name = ""
+            self.employee_form_email = ""
+            self.employee_form_role = ""
+            self.employee_form_password = ""
+
+    async def load_employees(self) -> None:
+        if not self._auth_token:
+            self._clear_session()
+            return
+        try:
+            self.employees = await list_employees(self._auth_token)
+        except XanoApiError as error:
+            if error.status_code == 401:
+                self._clear_session()
+            self.registration_feedback = self._error_message(
+                error, "consultar os funcionários"
+            )
+
+    def set_employee_search(self, value: str) -> None:
+        self.employee_search = value
+
+    @rx.var
+    def filtered_employees(self) -> list[dict[str, Any]]:
+        query = self.employee_search.strip().casefold()
+        if not query:
+            return self.employees
+        return [
+            employee
+            for employee in self.employees
+            if query in str(employee.get("name", "")).casefold()
+            or query in str(employee.get("email", "")).casefold()
+            or query in str(employee.get("role", "")).casefold()
+        ]
+
+    @rx.var
+    def employee_total(self) -> int:
+        return len(self.employees)
+
+    @rx.var
+    def employee_filtered_total(self) -> int:
+        return len(self.filtered_employees)
+
+    @rx.var
+    def employee_search_is_empty(self) -> bool:
+        return not self.employee_search.strip()
+
+    def start_employee_edit(self, employee: dict[str, Any]) -> None:
+        self.employee_editing_id = int(employee.get("id", 0))
+        self.employee_form_name = str(employee.get("name", ""))
+        self.employee_form_email = str(employee.get("email", ""))
+        self.employee_form_role = str(employee.get("role", ""))
+        self.employee_form_password = ""
+        self.registration_feedback = ""
+
+    def cancel_employee_edit(self) -> None:
+        self.employee_editing_id = 0
+        self.employee_form_name = ""
+        self.employee_form_email = ""
+        self.employee_form_role = ""
+        self.employee_form_password = ""
+
+    def set_employee_form_name(self, value: str) -> None:
+        self.employee_form_name = value
+
+    def set_employee_form_email(self, value: str) -> None:
+        self.employee_form_email = value
+
+    def set_employee_form_role(self, value: str) -> None:
+        self.employee_form_role = value
+
+    def set_employee_form_password(self, value: str) -> None:
+        self.employee_form_password = value
+
+    async def save_employee(self) -> None:
+        if self.user_role not in {"owner", "manager"}:
+            self.registration_feedback = "Você não tem autorização para alterar funcionários."
+            return
+        name = self.employee_form_name.strip()
+        email = self.employee_form_email.strip()
+        role = normalize_role(self.employee_form_role)
+        password = self.employee_form_password
+        if not name or not email or role is None:
+            self.registration_feedback = "Preencha nome, e-mail e cargo com valores válidos."
+            return
+        if password:
+            password_error = validate_password(password)
+            if password_error:
+                self.registration_feedback = password_error
+                return
+        if not self._auth_token or not self.employee_editing_id:
+            self.registration_feedback = "Selecione um funcionário para editar."
+            return
+        self.is_busy = True
+        try:
+            await update_employee(
+                self._auth_token,
+                self.employee_editing_id,
+                name,
+                email,
+                role,
+                password,
+            )
+            await self.load_employees()
+            self.cancel_employee_edit()
+            self.registration_feedback = "Funcionário atualizado com sucesso."
+        except XanoApiError as error:
+            if error.status_code == 401:
+                self._clear_session()
+            self.registration_feedback = self._error_message(
+                error, "atualizar o funcionário"
+            )
+        finally:
+            self.is_busy = False
+
+    def open_employee_delete(self, employee: dict[str, Any]) -> None:
+        self.employee_delete_id = int(employee.get("id", 0))
+        self.employee_delete_name = str(employee.get("name", ""))
+        self.employee_delete_open = True
+
+    def close_employee_delete(self) -> None:
+        self.employee_delete_id = 0
+        self.employee_delete_name = ""
+        self.employee_delete_open = False
+
+    async def confirm_employee_delete(self) -> None:
+        if self.user_role not in {"owner", "manager"}:
+            self.registration_feedback = "Você não tem autorização para excluir funcionários."
+            self.close_employee_delete()
+            return
+        if not self._auth_token or not self.employee_delete_id:
+            self.registration_feedback = "Sua sessão expirou. Faça login novamente."
+            self.close_employee_delete()
+            return
+        self.is_busy = True
+        try:
+            await delete_employee(self._auth_token, self.employee_delete_id)
+            await self.load_employees()
+            self.registration_feedback = "Funcionário excluído com sucesso."
+            self.close_employee_delete()
+        except XanoApiError as error:
+            if error.status_code == 401:
+                self._clear_session()
+            self.registration_feedback = self._error_message(
+                error, "excluir o funcionário"
+            )
         finally:
             self.is_busy = False
 
@@ -797,7 +975,10 @@ def sidebar_item(label: str, destination: str, is_active: bool = False) -> rx.Co
     )
 
 
-def sidebar(active_destination: str = "home") -> rx.Component:
+def sidebar(
+    active_destination: str = "home",
+    fixed_for_registration: bool = False,
+) -> rx.Component:
     return rx.box(
         rx.vstack(
             rx.text(
@@ -873,6 +1054,10 @@ def sidebar(active_destination: str = "home") -> rx.Component:
         class_name="dashboard-sidebar",
         background="#3B82F6",
         color="white",
+        position="fixed" if fixed_for_registration else "relative",
+        top="0" if fixed_for_registration else "auto",
+        left="0" if fixed_for_registration else "auto",
+        z_index="10" if fixed_for_registration else "auto",
     )
 
 
@@ -1236,12 +1421,25 @@ def registration_form_panel() -> rx.Component:
 
     return rx.box(
         rx.vstack(
+            rx.heading(
+                rx.cond(
+                    AuthState.employee_editing_id > 0,
+                    "Editar Funcionário",
+                    "Adicionar Funcionário",
+                ),
+                size="5",
+                color="#172033",
+                text_align="left",
+                width="100%",
+            ),
             rx.form(
                 rx.input(
                     type="text",
                     name="name",
                     placeholder="Digite o nome do funcionário",
                     aria_label="Digite o nome do funcionário",
+                    value=AuthState.employee_form_name,
+                    on_change=AuthState.set_employee_form_name,
                     class_name="registration-form-input",
                     **input_style,
                 ),
@@ -1250,14 +1448,22 @@ def registration_form_panel() -> rx.Component:
                     name="email",
                     placeholder="Digite o e-mail do funcionário",
                     aria_label="Digite o e-mail do funcionário",
+                    value=AuthState.employee_form_email,
+                    on_change=AuthState.set_employee_form_email,
                     class_name="registration-form-input",
                     **input_style,
                 ),
                 rx.input(
                     type="password",
                     name="password",
-                    placeholder="Digite a senha desejada",
+                    placeholder=rx.cond(
+                        AuthState.employee_editing_id > 0,
+                        "Nova senha (opcional)",
+                        "Digite a senha desejada",
+                    ),
                     aria_label="Digite a senha desejada",
+                    value=AuthState.employee_form_password,
+                    on_change=AuthState.set_employee_form_password,
                     class_name="registration-form-input",
                     **input_style,
                 ),
@@ -1266,12 +1472,18 @@ def registration_form_panel() -> rx.Component:
                     name="role",
                     placeholder="Digite a função do funcionário",
                     aria_label="Digite a função do funcionário",
+                    value=AuthState.employee_form_role,
+                    on_change=AuthState.set_employee_form_role,
                     class_name="registration-form-input",
                     justify_content="center",
                     **input_style,
                 ),
                 rx.button(
-                    "Cadastrar",
+                    rx.cond(
+                        AuthState.employee_editing_id > 0,
+                        "Salvar alterações",
+                        "Cadastrar Funcionário",
+                    ),
                     type="submit",
                     width="100%",
                     height="3.2rem",
@@ -1307,8 +1519,22 @@ def registration_form_panel() -> rx.Component:
                 align="stretch",
                 display="flex",
                 flex_direction="column",
-                on_submit=AuthState.register_employee,
+                on_submit=AuthState.submit_employee_form,
                 reset_on_submit=False,
+            ),
+            rx.cond(
+                AuthState.employee_editing_id > 0,
+                rx.button(
+                    "Cancelar edição",
+                    type="button",
+                    on_click=AuthState.cancel_employee_edit,
+                    width="100%",
+                    height="2.6rem",
+                    border_radius="0.7rem",
+                    background="#E5E7EB",
+                    color="#172033",
+                ),
+                rx.fragment(),
             ),
             width="100%",
             max_width="42rem",
@@ -1322,6 +1548,213 @@ def registration_form_panel() -> rx.Component:
         border_radius="1rem",
         box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
         padding="clamp(1.5rem, 3vw, 2.25rem)",
+        height="31rem",
+        box_sizing="border-box",
+    )
+
+
+def employee_row(employee: dict[str, Any]) -> rx.Component:
+    return rx.box(
+        rx.text(employee["name"], color="#172033", overflow="hidden", text_overflow="ellipsis"),
+        rx.text(employee["email"], color="#172033", overflow="hidden", text_overflow="ellipsis"),
+        rx.text(employee["role"], color="#172033"),
+        rx.hstack(
+            rx.button(
+                rx.icon("pencil", size=16),
+                aria_label="Editar funcionário",
+                on_click=AuthState.start_employee_edit(employee),
+                background="#3B82F6",
+                color="white",
+                size="2",
+            ),
+            rx.button(
+                rx.icon("trash-2", size=16),
+                aria_label="Excluir funcionário",
+                on_click=AuthState.open_employee_delete(employee),
+                background="#DC2626",
+                color="white",
+                size="2",
+            ),
+            gap="0.45rem",
+        ),
+        display="grid",
+        grid_template_columns="minmax(10rem, 1.3fr) minmax(12rem, 1.7fr) minmax(7rem, 0.8fr) 5rem",
+        gap="0.8rem",
+        align_items="center",
+        min_width="36rem",
+        padding="0.8rem 0.2rem",
+        border_bottom="1px solid #EEF1F5",
+    )
+
+
+def employee_delete_modal() -> rx.Component:
+    return rx.cond(
+        AuthState.employee_delete_open,
+        rx.box(
+            rx.box(
+                rx.hstack(
+                    rx.icon("trash-2", size=26, color="#DC2626"),
+                    rx.heading("Confirmar exclusão", size="5", color="#172033"),
+                    justify="center",
+                    gap="0.7rem",
+                ),
+                rx.text(
+                    "Tem certeza que deseja excluir o funcionário ",
+                    rx.text(AuthState.employee_delete_name, as_="strong"),
+                    "?",
+                    color="#172033",
+                    text_align="center",
+                ),
+                rx.text(
+                    "Esta ação não pode ser desfeita e o funcionário será removido do sistema.",
+                    color="#5B6475",
+                    text_align="center",
+                    font_size="0.9rem",
+                ),
+                rx.hstack(
+                    rx.button(
+                        "Cancelar",
+                        on_click=AuthState.close_employee_delete,
+                        background="#E5E7EB",
+                        color="#172033",
+                        flex="1",
+                    ),
+                    rx.button(
+                        "Excluir",
+                        on_click=AuthState.confirm_employee_delete,
+                        background="#DC2626",
+                        color="white",
+                        flex="1",
+                    ),
+                    width="100%",
+                    gap="0.75rem",
+                ),
+                width="min(28rem, calc(100vw - 2rem))",
+                padding="2rem",
+                background="white",
+                border_radius="1rem",
+                box_shadow="0 18px 50px rgba(23, 32, 51, 0.2)",
+                display="flex",
+                flex_direction="column",
+                gap="1rem",
+            ),
+            position="fixed",
+            inset="0",
+            z_index="20",
+            display="flex",
+            align_items="center",
+            justify_content="center",
+            background="rgba(23, 32, 51, 0.42)",
+            padding="1rem",
+        ),
+        rx.fragment(),
+    )
+
+
+def registration_list_panel() -> rx.Component:
+    return rx.box(
+        rx.vstack(
+            rx.heading(
+                "Funcionários cadastrados",
+                size="5",
+                color="#172033",
+                text_align="left",
+                width="100%",
+            ),
+            rx.hstack(
+                rx.input(
+                    placeholder="Pesquisar por nome, e-mail ou cargo",
+                    aria_label="Pesquisar funcionários",
+                    value=AuthState.employee_search,
+                    on_change=AuthState.set_employee_search,
+                    width="100%",
+                    height="3.1rem",
+                    background="#F7F9FC",
+                    color="#172033",
+                    border="1px solid #E5E7EB",
+                    border_radius="0.7rem",
+                ),
+                rx.text(
+                    rx.cond(
+                        AuthState.employee_search_is_empty,
+                        rx.fragment("Total: ", AuthState.employee_total),
+                        rx.fragment(
+                            "Exibindo: ",
+                            AuthState.employee_filtered_total,
+                            " de ",
+                            AuthState.employee_total,
+                        ),
+                    ),
+                    color="#5B6475",
+                    font_size="0.85rem",
+                    white_space="nowrap",
+                ),
+                width="100%",
+                align="center",
+                gap="1rem",
+            ),
+            rx.box(
+                rx.box(
+                    rx.text("Nome", font_weight="700", color="#5B6475"),
+                    rx.text("E-mail", font_weight="700", color="#5B6475"),
+                    rx.text("Cargo", font_weight="700", color="#5B6475"),
+                    rx.text("Ações", font_weight="700", color="#5B6475"),
+                    display="grid",
+                    grid_template_columns="minmax(10rem, 1.3fr) minmax(12rem, 1.7fr) minmax(7rem, 0.8fr) 5rem",
+                    gap="0.8rem",
+                    min_width="36rem",
+                    padding="0.8rem 0.2rem",
+                    border_bottom="1px solid #DDE3EC",
+                ),
+                rx.cond(
+                    AuthState.employee_filtered_total > 0,
+                    rx.foreach(AuthState.filtered_employees, employee_row),
+                    rx.text(
+                        "Nenhum funcionário encontrado",
+                        color="#5B6475",
+                        text_align="center",
+                        padding="2rem 0",
+                    ),
+                ),
+                width="100%",
+                overflow_y="auto",
+                overflow_x="auto",
+                flex="1",
+                min_height="0",
+            ),
+            rx.text(
+                AuthState.registration_feedback,
+                role="status",
+                color="#172033",
+                font_size="0.82rem",
+                width="100%",
+                min_height="1.15rem",
+            ),
+            width="100%",
+            gap="0.85rem",
+            align="stretch",
+            height="100%",
+        ),
+        width="100%",
+        max_width="42rem",
+        margin="0 auto",
+        background="white",
+        border_radius="1rem",
+        box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
+        padding="clamp(1.5rem, 3vw, 2.25rem)",
+        height="31rem",
+        box_sizing="border-box",
+    )
+
+
+def registration_panels() -> rx.Component:
+    return rx.vstack(
+        registration_form_panel(),
+        registration_list_panel(),
+        width="100%",
+        gap="1.5rem",
+        align="stretch",
+        position="relative",
     )
 
 
@@ -1675,9 +2108,13 @@ def dashboard_layout(
     content: rx.Component,
     active_destination: str = "home",
     subtitle: str = "Aqui está um resumo do seu mercado hoje.",
+    fixed_sidebar: bool = False,
 ) -> rx.Component:
     return rx.hstack(
-        sidebar(active_destination=active_destination),
+        sidebar(
+            active_destination=active_destination,
+            fixed_for_registration=fixed_sidebar,
+        ),
         rx.box(
             rx.vstack(
                 dashboard_header(subtitle=subtitle),
@@ -1704,12 +2141,14 @@ def dashboard_layout(
             min_height="100dvh",
             overflow="auto",
             background="#F7F9FC",
+            margin_left="16rem" if fixed_sidebar else "0",
         ),
         width="100%",
         min_height="100dvh",
         align="stretch",
         gap="0",
         background="#F7F9FC",
+        position="relative",
     )
 
 
@@ -1722,12 +2161,13 @@ def dashboard() -> rx.Component:
     )
 
 
-@rx.page(route="/cadastro", on_load=AuthState.require_admin)
+@rx.page(route="/cadastro", on_load=AuthState.require_admin_and_load_employees)
 def registration_page() -> rx.Component:
     return dashboard_layout(
-        registration_form_panel(),
+        registration_panels(),
         active_destination="registration",
         subtitle="Aqui você pode adicionar funcionários novos ao sistema de gerenciamento do mercado",
+        fixed_sidebar=True,
     )
 
 

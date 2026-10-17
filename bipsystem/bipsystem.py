@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import reflex as rx
@@ -888,6 +889,7 @@ ROUTE_BY_DESTINATION = {
     "products": "/produtos",
     "reports": "/relatorios",
     "registration": "/cadastro",
+    "prices": "/precos",
 }
 
 SIDEBAR_ITEMS = (
@@ -897,6 +899,7 @@ SIDEBAR_ITEMS = (
     ("Produto", "products"),
     ("Relatórios", "reports"),
     ("Cadastro", "registration"),
+    ("Preços", "prices"),
 )
 
 DASHBOARD_CARDS = (
@@ -934,6 +937,13 @@ DASHBOARD_CARDS = (
         "icon": "user-plus",
         "color": "#A3E635",
         "destination": "registration",
+    },
+    {
+        "title": "Preço",
+        "description": "Cadastre e consulte os preços dos produtos",
+        "icon": "tag",
+        "color": "#8B5CF6",
+        "destination": "prices",
     },
 )
 
@@ -1194,7 +1204,7 @@ def dashboard_cards() -> rx.Component:
         rx.box(
             *[
                 dashboard_card(card, destination=card["destination"])
-                for card in DASHBOARD_CARDS[:3]
+                for card in DASHBOARD_CARDS
             ],
             width="100%",
             max_width="62rem",
@@ -1203,21 +1213,397 @@ def dashboard_cards() -> rx.Component:
             class_name="dashboard-card-grid dashboard-card-grid-primary",
             gap="2.5rem",
         ),
-        rx.box(
-            *[
-                dashboard_card(card, destination=card["destination"])
-                for card in DASHBOARD_CARDS[3:]
-            ],
-            width="100%",
-            max_width="40.25rem",
-            display="grid",
-            grid_template_columns="1fr",
-            class_name="dashboard-card-grid dashboard-card-grid-secondary",
-            gap="5rem",
-        ),
         width="100%",
         align="center",
-        gap="2.5rem",
+    )
+
+
+class PricesState(rx.State):
+    mock_products: list[dict[str, str]] = [
+        {
+            "product": "Salgadinho Doritos 37 g",
+            "barcode": "7892840816469",
+            "type": "Salgadinho",
+            "brand": "Doritos",
+            "weight": "37 g",
+        },
+        {
+            "product": "Arroz Tio Urbano 5000 g",
+            "barcode": "7896290300011",
+            "type": "Arroz",
+            "brand": "Tio Urbano",
+            "weight": "5000 g",
+        },
+        {
+            "product": "Margarina Qualy 500 g",
+            "barcode": "7891000205023",
+            "type": "Margarina",
+            "brand": "Qualy",
+            "weight": "500 g",
+        },
+    ]
+    mock_prices: list[dict[str, str]] = [
+        {
+            "product": "Salgadinho Doritos 37 g",
+            "barcode": "7892840816469",
+            "brand": "Doritos",
+            "price": "R$ 5,99",
+            "date": "16/10/2026",
+        },
+        {
+            "product": "Arroz Tio Urbano 5000 g",
+            "barcode": "7896290300011",
+            "brand": "Tio Urbano",
+            "price": "R$ 24,90",
+            "date": "16/10/2026",
+        },
+        {
+            "product": "Margarina Qualy 500 g",
+            "barcode": "7891000205023",
+            "brand": "Qualy",
+            "price": "R$ 8,49",
+            "date": "16/10/2026",
+        },
+    ]
+    barcode_input: str = ""
+    price_input: str = ""
+    price_search_input: str = ""
+    applied_price_search: str = ""
+    selected_product: dict[str, str] = {}
+    has_selected_product: bool = False
+    feedback: str = ""
+    feedback_is_error: bool = False
+
+    def set_barcode_input(self, value: str) -> None:
+        self.barcode_input = value
+
+    def set_price_input(self, value: str) -> None:
+        self.price_input = value
+
+    def set_price_search_input(self, value: str) -> None:
+        self.price_search_input = value
+
+    def search_mock_product(self) -> None:
+        barcode = self.barcode_input.strip()
+        product = next(
+            (item for item in self.mock_products if item["barcode"] == barcode),
+            None,
+        )
+        self.selected_product = product or {}
+        self.has_selected_product = product is not None
+        self.feedback = (
+            "Produto encontrado."
+            if product is not None
+            else "Nenhum produto encontrado para este código de barras."
+        )
+        self.feedback_is_error = product is None
+
+    def link_mock_price(self) -> None:
+        if not self.has_selected_product:
+            self.feedback = "Pesquise um produto pelo código de barras primeiro."
+            self.feedback_is_error = True
+            return
+
+        try:
+            price = Decimal(self.price_input.strip().replace(",", "."))
+        except InvalidOperation:
+            price = Decimal("0")
+        if not price.is_finite() or price <= 0:
+            self.feedback = "Digite um preço válido."
+            self.feedback_is_error = True
+            return
+
+        product = self.selected_product
+        formatted_price = f"R$ {price:.2f}".replace(".", ",")
+        updated = {
+            "product": product["product"],
+            "barcode": product["barcode"],
+            "brand": product["brand"],
+            "price": formatted_price,
+            "date": "16/10/2026",
+        }
+        existing_index = next(
+            (
+                index
+                for index, record in enumerate(self.mock_prices)
+                if record["barcode"] == product["barcode"]
+            ),
+            None,
+        )
+        if existing_index is None:
+            self.mock_prices = [updated, *self.mock_prices]
+        else:
+            self.mock_prices[existing_index] = updated
+            self.mock_prices = list(self.mock_prices)
+        self.feedback = "Preço vinculado localmente."
+        self.feedback_is_error = False
+        self.price_input = ""
+
+    def search_mock_prices(self) -> None:
+        self.applied_price_search = self.price_search_input.strip().casefold()
+
+    @rx.var
+    def filtered_mock_prices(self) -> list[dict[str, str]]:
+        query = self.applied_price_search
+        if not query:
+            return self.mock_prices
+        return [
+            price
+            for price in self.mock_prices
+            if query in price["product"].casefold()
+            or query in price["barcode"].casefold()
+            or query in price["brand"].casefold()
+        ]
+
+
+def prices_table_row(price: dict[str, str]) -> rx.Component:
+    return rx.box(
+        rx.text(price["product"], color="#172033", min_width="0", overflow_wrap="anywhere"),
+        rx.text(price["barcode"], color="#172033", min_width="0", overflow_wrap="anywhere"),
+        rx.text(price["price"], color="#172033", min_width="0"),
+        rx.text(price["date"], color="#172033", min_width="0"),
+        display="grid",
+        grid_template_columns="2fr 1.35fr 0.8fr 0.9fr",
+        gap="0.75rem",
+        min_width="42rem",
+        align_items="center",
+        padding="0.85rem 0.25rem",
+        border_bottom="1px solid #EEF1F5",
+    )
+
+
+def price_field(label: str, control: rx.Component) -> rx.Component:
+    return rx.vstack(
+        rx.text(label, color="#172033", font_weight="600", font_size="0.92rem"),
+        control,
+        width="100%",
+        align="stretch",
+        gap="0.45rem",
+    )
+
+
+def prices_panel() -> rx.Component:
+    input_style = {
+        "width": "100%",
+        "height": "3.1rem",
+        "padding": "0 1rem",
+        "text_align": "left",
+        "border_radius": "0.7rem",
+        "border": "1px solid #E5E7EB",
+        "background": "#D9D9D9",
+        "color": "#000000",
+        "font_size": "0.98rem",
+        "_placeholder": {"color": "#000000", "opacity": "1"},
+        "_focus": {
+            "background": "#D9D9D9",
+            "border_color": "#93C5FD",
+            "color": "#000000",
+        },
+    }
+    primary_button_style = {
+        "height": "3.1rem",
+        "border_radius": "0.7rem",
+        "background": "#3B82F6",
+        "color": "white",
+        "font_weight": "700",
+        "box_shadow": "0 8px 18px rgba(59, 130, 246, 0.2)",
+        "_hover": {"background": "#2563EB"},
+    }
+
+    return rx.vstack(
+        rx.box(
+            rx.vstack(
+                rx.heading("Cadastar Preço de Produto", size="5", color="#172033"),
+                rx.text(
+                    "Relacione um código de barras já cadastrado a um preço.",
+                    color="#7A8496",
+                    font_size="0.95rem",
+                ),
+                rx.box(
+                    price_field(
+                        "Código de barras",
+                        rx.hstack(
+                            rx.input(
+                                placeholder="Digite o código de barras",
+                                aria_label="Código de barras do produto",
+                                value=PricesState.barcode_input,
+                                on_change=PricesState.set_barcode_input,
+                                **input_style,
+                            ),
+                            rx.button(
+                                rx.icon("search", size=19),
+                                aria_label="Pesquisar código de barras",
+                                on_click=PricesState.search_mock_product,
+                                width="3.1rem",
+                                min_width="3.1rem",
+                                **primary_button_style,
+                            ),
+                            width="100%",
+                            gap="0.6rem",
+                        ),
+                    ),
+                    price_field(
+                        "Preço",
+                        rx.input(
+                            type="text",
+                            input_mode="decimal",
+                            placeholder="R$ 0,00",
+                            aria_label="Preço do produto",
+                            value=PricesState.price_input,
+                            on_change=PricesState.set_price_input,
+                            **input_style,
+                        ),
+                    ),
+                    class_name="prices-fields-grid",
+                    display="grid",
+                    grid_template_columns="minmax(0, 1fr)",
+                    gap="1rem",
+                    width="100%",
+                ),
+                rx.button(
+                    "Vincular Preço",
+                    type="button",
+                    on_click=PricesState.link_mock_price,
+                    width="100%",
+                    **primary_button_style,
+                ),
+                rx.cond(
+                    PricesState.has_selected_product,
+                    rx.box(
+                        rx.vstack(
+                            rx.heading("Produto selecionado", size="3", color="#172033"),
+                            rx.box(
+                                rx.vstack(
+                                    rx.text("Produto", color="#7A8496", font_size="0.82rem"),
+                                    rx.text(
+                                        PricesState.selected_product["product"],
+                                        color="#172033",
+                                        font_weight="600",
+                                    ),
+                                    align="start",
+                                    gap="0.3rem",
+                                ),
+                                rx.vstack(
+                                    rx.text("Tipo", color="#7A8496", font_size="0.82rem"),
+                                    rx.text(PricesState.selected_product["type"], color="#172033"),
+                                    align="start",
+                                    gap="0.3rem",
+                                ),
+                                rx.vstack(
+                                    rx.text("Marca", color="#7A8496", font_size="0.82rem"),
+                                    rx.text(PricesState.selected_product["brand"], color="#172033"),
+                                    align="start",
+                                    gap="0.3rem",
+                                ),
+                                rx.vstack(
+                                    rx.text("Gramas", color="#7A8496", font_size="0.82rem"),
+                                    rx.text(PricesState.selected_product["weight"], color="#172033"),
+                                    align="start",
+                                    gap="0.3rem",
+                                ),
+                                class_name="prices-selected-details",
+                                display="grid",
+                                grid_template_columns="minmax(0, 1fr)",
+                                gap="1rem",
+                                width="100%",
+                            ),
+                            align="stretch",
+                            gap="0.85rem",
+                            width="100%",
+                        ),
+                        width="100%",
+                        padding="1rem",
+                        background="#F7F9FC",
+                        border="1px solid #E5E7EB",
+                        border_radius="0.7rem",
+                    ),
+                    rx.fragment(),
+                ),
+                rx.text(
+                    PricesState.feedback,
+                    color=rx.cond(PricesState.feedback_is_error, "#DC2626", "#15803D"),
+                    role="status",
+                    min_height="1.2rem",
+                ),
+                width="100%",
+                align="stretch",
+                gap="1rem",
+            ),
+            width="100%",
+            padding="clamp(1.25rem, 2.5vw, 2rem)",
+            background="white",
+            border_radius="1rem",
+            box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
+        ),
+        rx.divider(width="100%", border_color="#DDE3EC"),
+        rx.box(
+            rx.vstack(
+                rx.heading("Consultar Preços", size="5", color="#172033"),
+                rx.hstack(
+                    rx.input(
+                        placeholder="Digite o código de barras, nome do produto ou marca",
+                        aria_label="Consultar preços por código, nome ou marca",
+                        value=PricesState.price_search_input,
+                        on_change=PricesState.set_price_search_input,
+                        **input_style,
+                    ),
+                    rx.button(
+                        rx.hstack(rx.text("Consultar"), rx.icon("search", size=18), gap="0.5rem"),
+                        type="button",
+                        on_click=PricesState.search_mock_prices,
+                        **primary_button_style,
+                        padding="0 1.2rem",
+                    ),
+                    width="100%",
+                    gap="0.75rem",
+                    align="center",
+                    class_name="prices-search-row",
+                ),
+                rx.heading("Preços cadastrados", size="4", color="#172033", margin_top="0.5rem"),
+                rx.box(
+                    rx.text("Produto", font_weight="700", color="#5B6475", min_width="0"),
+                    rx.text("Código de barras", font_weight="700", color="#5B6475", min_width="0"),
+                    rx.text("Preço", font_weight="700", color="#5B6475", min_width="0"),
+                    rx.text("Cadastrado em", font_weight="700", color="#5B6475", min_width="0"),
+                    display="grid",
+                    grid_template_columns="2fr 1.35fr 0.8fr 0.9fr",
+                    gap="0.75rem",
+                    min_width="42rem",
+                    padding="0.85rem 0.25rem",
+                    border_bottom="1px solid #DDE3EC",
+                ),
+                rx.box(
+                    rx.cond(
+                        PricesState.filtered_mock_prices.length() > 0,
+                        rx.foreach(PricesState.filtered_mock_prices, prices_table_row),
+                        rx.text(
+                            "Nenhum preço encontrado.",
+                            color="#5B6475",
+                            text_align="center",
+                            padding="1.5rem 0",
+                        ),
+                    ),
+                    width="100%",
+                    overflow_x="auto",
+                    max_height="22rem",
+                    overflow_y="auto",
+                    class_name="prices-table-scroll",
+                ),
+                width="100%",
+                align="stretch",
+                gap="1rem",
+            ),
+            width="100%",
+            padding="clamp(1.25rem, 2.5vw, 2rem)",
+            background="white",
+            border_radius="1rem",
+            box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
+        ),
+        width="100%",
+        max_width="62rem",
+        margin="0 auto",
+        align="stretch",
+        gap="1.5rem",
     )
 
 
@@ -2274,6 +2660,15 @@ def relatorios_page() -> rx.Component:
     )
 
 
+@rx.page(route="/precos", on_load=AuthState.require_admin)
+def precos_page() -> rx.Component:
+    return dashboard_layout(
+        prices_panel(),
+        active_destination="prices",
+        subtitle="Aqui você pode cadastrar e consultar preços dos produtos",
+    )
+
+
 @rx.page(route="/caixa", on_load=AuthState.require_auth)
 def caixa_page() -> rx.Component:
     return cashier_page_content()
@@ -2392,6 +2787,23 @@ app = rx.App(
         "@media (min-width: 1080px)": {
             ".dashboard-card-grid-primary": {
                 "grid_template_columns": "repeat(3, minmax(0, 1fr))",
+            },
+        },
+        "@media (min-width: 760px)": {
+            ".prices-fields-grid": {
+                "grid_template_columns": "minmax(0, 1.5fr) minmax(10rem, 0.7fr)",
+            },
+            ".prices-selected-details": {
+                "grid_template_columns": "minmax(0, 1.5fr) repeat(3, minmax(0, 1fr))",
+            },
+        },
+        "@media (max-width: 639px)": {
+            ".prices-search-row": {
+                "flex_direction": "column",
+                "align_items": "stretch",
+            },
+            ".prices-search-row button": {
+                "width": "100%",
             },
         },
         "@media (max-width: 639px)": {

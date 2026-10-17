@@ -56,6 +56,7 @@ class AuthState(rx.State):
     employee_delete_id: int = 0
     employee_delete_name: str = ""
     employee_delete_open: bool = False
+    employee_delete_busy: bool = False
     employee_form_name: str = ""
     employee_form_email: str = ""
     employee_form_role: str = ""
@@ -168,6 +169,7 @@ class AuthState(rx.State):
             return rx.redirect("/")
 
     async def require_admin_and_load_employees(self) -> Any:
+        self.registration_feedback = ""
         result = await self.require_admin()
         if result is not None:
             return result
@@ -340,38 +342,72 @@ class AuthState(rx.State):
             self.is_busy = False
 
     def open_employee_delete(self, employee: dict[str, Any]) -> None:
-        self.employee_delete_id = int(employee.get("id", 0))
+        if self.employee_delete_busy:
+            return
+        try:
+            employee_id = int(employee.get("id", 0))
+        except (TypeError, ValueError):
+            self.registration_feedback = "Não foi possível identificar o funcionário."
+            return
+        if employee_id <= 0 or not any(
+            str(record.get("id", "")) == str(employee_id)
+            for record in self.employees
+        ):
+            self.registration_feedback = "Funcionário não encontrado na lista."
+            return
+        self.registration_feedback = ""
+        self.employee_delete_id = employee_id
         self.employee_delete_name = str(employee.get("name", ""))
         self.employee_delete_open = True
 
     def close_employee_delete(self) -> None:
+        if self.employee_delete_busy:
+            return
         self.employee_delete_id = 0
         self.employee_delete_name = ""
         self.employee_delete_open = False
 
     async def confirm_employee_delete(self) -> None:
+        if self.employee_delete_busy or not self.employee_delete_open:
+            return
         if self.user_role not in {"owner", "manager"}:
             self.registration_feedback = "Você não tem autorização para excluir funcionários."
             self.close_employee_delete()
             return
-        if not self._auth_token or not self.employee_delete_id:
+        employee_id = self.employee_delete_id
+        if not self._auth_token or employee_id <= 0:
             self.registration_feedback = "Sua sessão expirou. Faça login novamente."
             self.close_employee_delete()
             return
-        self.is_busy = True
-        try:
-            await delete_employee(self._auth_token, self.employee_delete_id)
-            await self.load_employees()
-            self.registration_feedback = "Funcionário excluído com sucesso."
+        if not any(
+            str(employee.get("id", "")) == str(employee_id)
+            for employee in self.employees
+        ):
+            self.registration_feedback = "Funcionário não encontrado na lista."
             self.close_employee_delete()
+            return
+
+        self.employee_delete_busy = True
+        try:
+            await delete_employee(self._auth_token, employee_id)
+            self.employees = [
+                employee
+                for employee in self.employees
+                if str(employee.get("id", "")) != str(employee_id)
+            ]
+            self.registration_feedback = "Funcionário excluído com sucesso."
         except XanoApiError as error:
             if error.status_code == 401:
                 self._clear_session()
-            self.registration_feedback = self._error_message(
-                error, "excluir o funcionário"
-            )
+            if error.status_code == 404:
+                self.registration_feedback = "O funcionário não foi encontrado ou já foi excluído."
+            else:
+                self.registration_feedback = self._error_message(
+                    error, "excluir o funcionário"
+                )
         finally:
-            self.is_busy = False
+            self.employee_delete_busy = False
+            self.close_employee_delete()
 
     def set_product_tipo(self, value: str) -> None:
         self.product_tipo = value
@@ -1048,6 +1084,7 @@ def sidebar(
         width="16rem",
         min_width="16rem",
         min_height="100dvh",
+        height="100dvh" if fixed_for_registration else "auto",
         padding="2.3rem 1.15rem",
         box_sizing="border-box",
         display="flex",
@@ -1429,7 +1466,7 @@ def registration_form_panel() -> rx.Component:
                 ),
                 size="5",
                 color="#172033",
-                text_align="left",
+                text_align="center",
                 width="100%",
             ),
             rx.form(
@@ -1515,6 +1552,7 @@ def registration_form_panel() -> rx.Component:
                     min_height="1.15rem",
                 ),
                 width="100%",
+                margin="0 auto",
                 gap="1rem",
                 align="stretch",
                 display="flex",
@@ -1539,115 +1577,137 @@ def registration_form_panel() -> rx.Component:
             width="100%",
             max_width="42rem",
             gap="1.5rem",
-            align="stretch",
+            align="center",
+            margin="0 auto",
         ),
         width="100%",
-        max_width="42rem",
-        margin="0 auto",
+        max_width="none",
+        margin="0",
         background="white",
         border_radius="1rem",
         box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
         padding="clamp(1.5rem, 3vw, 2.25rem)",
         height="31rem",
         box_sizing="border-box",
+        class_name="registration-form-panel",
     )
 
 
 def employee_row(employee: dict[str, Any]) -> rx.Component:
-    return rx.box(
-        rx.text(employee["name"], color="#172033", overflow="hidden", text_overflow="ellipsis"),
-        rx.text(employee["email"], color="#172033", overflow="hidden", text_overflow="ellipsis"),
-        rx.text(employee["role"], color="#172033"),
-        rx.hstack(
-            rx.button(
-                rx.icon("pencil", size=16),
-                aria_label="Editar funcionário",
-                on_click=AuthState.start_employee_edit(employee),
-                background="#3B82F6",
-                color="white",
-                size="2",
-            ),
-            rx.button(
-                rx.icon("trash-2", size=16),
-                aria_label="Excluir funcionário",
-                on_click=AuthState.open_employee_delete(employee),
-                background="#DC2626",
-                color="white",
-                size="2",
-            ),
-            gap="0.45rem",
-        ),
-        display="grid",
-        grid_template_columns="minmax(10rem, 1.3fr) minmax(12rem, 1.7fr) minmax(7rem, 0.8fr) 5rem",
-        gap="0.8rem",
-        align_items="center",
-        min_width="36rem",
-        padding="0.8rem 0.2rem",
-        border_bottom="1px solid #EEF1F5",
-    )
-
-
-def employee_delete_modal() -> rx.Component:
-    return rx.cond(
-        AuthState.employee_delete_open,
+    return rx.vstack(
         rx.box(
-            rx.box(
-                rx.hstack(
-                    rx.icon("trash-2", size=26, color="#DC2626"),
-                    rx.heading("Confirmar exclusão", size="5", color="#172033"),
-                    justify="center",
-                    gap="0.7rem",
+            rx.text(
+                employee["name"],
+                color="#172033",
+                min_width="0",
+                overflow_wrap="anywhere",
+            ),
+            rx.text(
+                employee["email"],
+                color="#172033",
+                min_width="0",
+                overflow_wrap="anywhere",
+            ),
+            rx.text(employee["role"], color="#172033", min_width="0"),
+            rx.hstack(
+                rx.button(
+                    rx.icon("pencil", size=16),
+                    aria_label="Editar funcionário",
+                    on_click=AuthState.start_employee_edit(employee),
+                    background="#3B82F6",
+                    color="white",
+                    width="2rem",
+                    min_width="2rem",
+                    height="2rem",
+                    padding="0",
+                    display="flex",
+                    align_items="center",
+                    justify_content="center",
+                    box_sizing="border-box",
                 ),
-                rx.text(
-                    "Tem certeza que deseja excluir o funcionário ",
-                    rx.text(AuthState.employee_delete_name, as_="strong"),
-                    "?",
-                    color="#172033",
-                    text_align="center",
+                rx.button(
+                    rx.icon("trash-2", size=16),
+                    aria_label="Excluir funcionário",
+                    on_click=AuthState.open_employee_delete(employee),
+                    background="#DC2626",
+                    color="white",
+                    width="2rem",
+                    min_width="2rem",
+                    height="2rem",
+                    padding="0",
+                    display="flex",
+                    align_items="center",
+                    justify_content="center",
+                    box_sizing="border-box",
                 ),
-                rx.text(
-                    "Esta ação não pode ser desfeita e o funcionário será removido do sistema.",
-                    color="#5B6475",
-                    text_align="center",
-                    font_size="0.9rem",
-                ),
-                rx.hstack(
-                    rx.button(
-                        "Cancelar",
-                        on_click=AuthState.close_employee_delete,
-                        background="#E5E7EB",
-                        color="#172033",
-                        flex="1",
-                    ),
-                    rx.button(
-                        "Excluir",
-                        on_click=AuthState.confirm_employee_delete,
-                        background="#DC2626",
-                        color="white",
-                        flex="1",
+                gap="0.25rem",
+                width="4.25rem",
+                min_width="4.25rem",
+                justify="center",
+            ),
+            display="grid",
+            grid_template_columns="minmax(0, 1.2fr) minmax(0, 1.6fr) minmax(5rem, 0.8fr) 4.5rem",
+            gap="0.5rem",
+            align_items="center",
+            min_width="0",
+            padding="0.8rem 0.2rem",
+            border_bottom="1px solid #EEF1F5",
+        ),
+        rx.cond(
+            AuthState.employee_delete_open,
+            rx.cond(
+                AuthState.employee_delete_id == employee["id"],
+                rx.box(
+                    rx.vstack(
+                        rx.text(
+                            "Excluir funcionário?",
+                            font_weight="700",
+                            color="#172033",
+                        ),
+                        rx.text(
+                            "Esta ação é permanente e não pode ser desfeita. ",
+                            "O funcionário ",
+                            AuthState.employee_delete_name,
+                            " será removido do sistema.",
+                            color="#5B6475",
+                            font_size="0.85rem",
+                        ),
+                        rx.hstack(
+                            rx.button(
+                                "Cancelar",
+                                on_click=AuthState.close_employee_delete,
+                                disabled=AuthState.employee_delete_busy,
+                                background="#E5E7EB",
+                                color="#172033",
+                                flex="1",
+                            ),
+                            rx.button(
+                                "Excluir",
+                                on_click=AuthState.confirm_employee_delete,
+                                disabled=AuthState.employee_delete_busy,
+                                background="#DC2626",
+                                color="white",
+                                flex="1",
+                            ),
+                            width="min(100%, 18rem)",
+                            gap="0.75rem",
+                        ),
+                        align="start",
+                        gap="0.5rem",
                     ),
                     width="100%",
-                    gap="0.75rem",
+                    padding="0.85rem 1rem",
+                    background="#FFF7F7",
+                    border="1px solid #FECACA",
+                    border_radius="0.65rem",
                 ),
-                width="min(28rem, calc(100vw - 2rem))",
-                padding="2rem",
-                background="white",
-                border_radius="1rem",
-                box_shadow="0 18px 50px rgba(23, 32, 51, 0.2)",
-                display="flex",
-                flex_direction="column",
-                gap="1rem",
+                rx.fragment(),
             ),
-            position="fixed",
-            inset="0",
-            z_index="20",
-            display="flex",
-            align_items="center",
-            justify_content="center",
-            background="rgba(23, 32, 51, 0.42)",
-            padding="1rem",
+            rx.fragment(),
         ),
-        rx.fragment(),
+        width="100%",
+        align="stretch",
+        gap="0.5rem",
     )
 
 
@@ -1673,6 +1733,7 @@ def registration_list_panel() -> rx.Component:
                     color="#172033",
                     border="1px solid #E5E7EB",
                     border_radius="0.7rem",
+                    class_name="registration-search-input",
                 ),
                 rx.text(
                     rx.cond(
@@ -1695,14 +1756,14 @@ def registration_list_panel() -> rx.Component:
             ),
             rx.box(
                 rx.box(
-                    rx.text("Nome", font_weight="700", color="#5B6475"),
-                    rx.text("E-mail", font_weight="700", color="#5B6475"),
-                    rx.text("Cargo", font_weight="700", color="#5B6475"),
-                    rx.text("Ações", font_weight="700", color="#5B6475"),
+                    rx.text("Nome", font_weight="700", color="#5B6475", min_width="0"),
+                    rx.text("E-mail", font_weight="700", color="#5B6475", min_width="0"),
+                    rx.text("Cargo", font_weight="700", color="#5B6475", min_width="0"),
+                    rx.text("Ações", font_weight="700", color="#5B6475", min_width="0"),
                     display="grid",
-                    grid_template_columns="minmax(10rem, 1.3fr) minmax(12rem, 1.7fr) minmax(7rem, 0.8fr) 5rem",
-                    gap="0.8rem",
-                    min_width="36rem",
+                    grid_template_columns="minmax(0, 1.2fr) minmax(0, 1.6fr) minmax(5rem, 0.8fr) 4.5rem",
+                    gap="0.5rem",
+                    min_width="0",
                     padding="0.8rem 0.2rem",
                     border_bottom="1px solid #DDE3EC",
                 ),
@@ -1721,6 +1782,7 @@ def registration_list_panel() -> rx.Component:
                 overflow_x="auto",
                 flex="1",
                 min_height="0",
+                class_name="registration-employee-scroll",
             ),
             rx.text(
                 AuthState.registration_feedback,
@@ -1736,24 +1798,28 @@ def registration_list_panel() -> rx.Component:
             height="100%",
         ),
         width="100%",
-        max_width="42rem",
-        margin="0 auto",
+        max_width="none",
+        margin="0",
         background="white",
         border_radius="1rem",
         box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
         padding="clamp(1.5rem, 3vw, 2.25rem)",
         height="31rem",
         box_sizing="border-box",
+        class_name="registration-list-panel",
     )
 
 
 def registration_panels() -> rx.Component:
-    return rx.vstack(
+    return rx.box(
         registration_form_panel(),
         registration_list_panel(),
+        class_name="registration-panels",
         width="100%",
+        display="grid",
+        grid_template_columns="minmax(0, 1fr)",
         gap="1.5rem",
-        align="stretch",
+        align_items="stretch",
         position="relative",
     )
 
@@ -2094,7 +2160,8 @@ def inventory_panel() -> rx.Component:
             padding="0.15rem 0.35rem 0.5rem 0.15rem",
             max_height="calc(100dvh - 18rem)",
             min_height="12rem",
-            scrollbar_width="thin",
+            scrollbar_width="none",
+            class_name="inventory-product-scroll",
         ),
         width="100%",
         max_width="62rem",
@@ -2252,6 +2319,32 @@ app = rx.App(
             "color": "#000000 !important",
             "opacity": "1 !important",
         },
+        ".registration-list-panel .registration-search-input, .registration-list-panel .registration-search-input:focus-within": {
+            "background": "#F7F9FC !important",
+            "border": "1px solid #E5E7EB !important",
+            "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2) !important",
+        },
+        ".registration-list-panel .registration-search-input input, .registration-list-panel .registration-search-input input:focus": {
+            "background": "#F7F9FC !important",
+            "color": "#000000 !important",
+        },
+        ".registration-list-panel .registration-search-input input::placeholder": {
+            "color": "#5B6475 !important",
+            "opacity": "1 !important",
+        },
+        ".registration-employee-scroll": {
+            "scrollbar_width": "none",
+            "-ms-overflow-style": "none",
+        },
+        ".registration-employee-scroll::-webkit-scrollbar": {
+            "display": "none",
+        },
+        ".inventory-product-scroll": {
+            "-ms-overflow-style": "none",
+        },
+        ".inventory-product-scroll::-webkit-scrollbar": {
+            "display": "none",
+        },
         ".rt-TextFieldRoot:focus-within": {
             "outline": "none !important",
             "border": "none !important",
@@ -2274,7 +2367,7 @@ app = rx.App(
             "align_items": "center",
             "text_align": "center !important",
             "padding": "0",
-            "width": "100%",
+            "width": "calc(100% - 2rem)",
             "margin": "0 auto",
             "box_sizing": "border-box",
         },

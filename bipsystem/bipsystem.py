@@ -1,48 +1,52 @@
-import asyncio
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import reflex as rx
 
 from bipsystem.auth_client import (
-    XanoApiError,
+    AuthSession,
+    SupabaseApiError,
     create_inventory_lot,
     create_product,
     create_employee,
+    create_product_price,
     delete_employee,
+    find_product_by_barcode,
     get_current_user,
     list_employees,
     list_inventory,
+    list_current_prices,
     list_products,
     is_valid_product_text,
     login,
+    logout,
     normalize_role,
     parse_inventory_date,
     parse_inventory_units,
     parse_product_weight,
-    update_inventory_lot,
+    refresh_session,
+    validate_price_cents,
     validate_password,
     update_employee,
 )
 
-INVENTORY_OPERATION_LOCK = asyncio.Lock()
-
-
-def find_inventory_record(
-    inventory: list[dict[str, Any]],
-    product_id: int,
-    validity: str,
-) -> dict[str, Any] | None:
-    return next(
-        (
-            record
-            for record in inventory
-            if record.get("produtos_id") == product_id
-            and str(record.get("validade") or "") == validity
-        ),
-        None,
-    )
+def filter_prices(
+    prices: list[dict[str, str]],
+    query: str,
+) -> list[dict[str, str]]:
+    normalized_query = query.strip().casefold()
+    if not normalized_query:
+        return prices
+    return [
+        price
+        for price in prices
+        if normalized_query in price["search"]
+    ]
 
 
 class AuthState(rx.State):
@@ -53,8 +57,8 @@ class AuthState(rx.State):
     registration_feedback: str = ""
     employees: list[dict[str, Any]] = []
     employee_search: str = ""
-    employee_editing_id: int = 0
-    employee_delete_id: int = 0
+    employee_editing_id: str = ""
+    employee_delete_id: str = ""
     employee_delete_name: str = ""
     employee_delete_open: bool = False
     employee_delete_busy: bool = False
@@ -74,31 +78,39 @@ class AuthState(rx.State):
     inventory_search: str = ""
     is_busy: bool = False
     _auth_token: str = ""
+    _refresh_token: str = ""
     _token_expires_at: float = 0.0
 
     @staticmethod
     def _error_message(
-        error: XanoApiError,
+        error: SupabaseApiError,
         action: str,
         authentication: bool = False,
     ) -> str:
         if error.status_code in (401, 403):
             if authentication:
-                return "Senha incorreta. Verifique sua senha e tente novamente."
+                if error.code in {"profile_missing", "invalid_profile"}:
+                    return "Sua conta não possui um perfil válido. Contate um administrador."
+                return "E-mail ou senha inválidos. Verifique os dados e tente novamente."
             return "Você não tem autorização para realizar esta ação."
+        if authentication and error.status_code == 400:
+            return "E-mail ou senha inválidos. Verifique os dados e tente novamente."
         if error.status_code == 409:
             return "Este e-mail já está cadastrado."
         if 400 <= error.status_code < 500:
             return "Verifique os dados informados e tente novamente."
         if error.status_code == 0:
-            return "Não foi possível conectar ao Xano."
+            return "Não foi possível conectar ao Supabase."
+        if error.code == "configuration_error":
+            return "O serviço de autenticação não está configurado corretamente."
         return f"Não foi possível {action}. Tente novamente."
 
     @staticmethod
     def get_post_login_redirect(user_role: str | None) -> str | None:
-        if user_role == "operator":
+        normalized_role = normalize_role(str(user_role or "")) if user_role is not None else None
+        if normalized_role in {"operator", "caixa"}:
             return "/caixa"
-        if user_role in {"owner", "manager"}:
+        if normalized_role in {"owner", "manager", "proprietario", "admin"}:
             return "/"
         return None
 
@@ -107,12 +119,18 @@ class AuthState(rx.State):
         self.user_name = "(nome)"
         self.user_role = ""
         self._auth_token = ""
+        self._refresh_token = ""
         self._token_expires_at = 0.0
 
     def _set_user(self, user: Any) -> None:
         self.authenticated = True
         self.user_name = user.name
-        self.user_role = user.role
+        self.user_role = normalize_role(str(user.role)) or user.role
+
+    def _set_session(self, session: AuthSession) -> None:
+        self._auth_token = session.access_token
+        self._refresh_token = session.refresh_token
+        self._token_expires_at = float(session.expires_at)
 
     async def submit(self, form_data: dict[str, Any]) -> Any:
         email = str(form_data.get("user", "")).strip()
@@ -125,19 +143,22 @@ class AuthState(rx.State):
 
         self.is_busy = True
         try:
-            token, _ = await login(email, password)
-            user = await get_current_user(token)
-            if user.is_active is False:
+            session = await login(email, password)
+            user = await get_current_user(session.access_token)
+            if not user.is_active:
+                await logout(session.access_token)
                 self.login_feedback = "Este usuário está inativo."
                 return
-            self._auth_token = token
-            self._token_expires_at = datetime.now(timezone.utc).timestamp() + 86400
+            self._set_session(session)
             self._set_user(user)
             redirect = self.get_post_login_redirect(self.user_role)
             if redirect is not None:
                 return rx.redirect(redirect)
+            await logout(session.access_token)
+            self._clear_session()
+            self.login_feedback = "Sua conta não possui um cargo válido."
             return None
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             self._clear_session()
             self.login_feedback = self._error_message(
                 error,
@@ -148,26 +169,52 @@ class AuthState(rx.State):
             self.is_busy = False
 
     async def require_auth(self) -> Any:
-        if not self._auth_token or self._token_expires_at <= datetime.now(timezone.utc).timestamp():
+        if not self._auth_token or not self._refresh_token:
             self._clear_session()
             return rx.redirect("/login")
 
         try:
+            if self._token_expires_at <= datetime.now(timezone.utc).timestamp() + 60:
+                session = await refresh_session(self._refresh_token)
+                self._set_session(session)
             user = await get_current_user(self._auth_token)
-            if user.is_active is False:
+            if not user.is_active:
                 self._clear_session()
                 return rx.redirect("/login")
             self._set_user(user)
-        except XanoApiError:
+        except SupabaseApiError as error:
             self._clear_session()
+            if error.status_code == 0:
+                self.login_feedback = "Não foi possível conectar ao Supabase."
+            elif error.code == "configuration_error":
+                self.login_feedback = "O serviço de autenticação não está configurado corretamente."
+            elif error.code in {"profile_missing", "invalid_profile"}:
+                self.login_feedback = "Sua conta não possui um perfil válido. Contate um administrador."
+            elif error.status_code >= 500:
+                self.login_feedback = "Não foi possível validar sua sessão. Tente novamente."
+            else:
+                self.login_feedback = "Sua sessão expirou. Entre novamente."
             return rx.redirect("/login")
 
     async def require_admin(self) -> Any:
         result = await self.require_auth()
         if result is not None:
             return result
-        if self.user_role not in {"owner", "manager"}:
+        if self.user_role not in {"owner", "manager", "proprietario", "admin"}:
             return rx.redirect("/")
+
+    async def require_operational_access(self) -> Any:
+        result = await self.require_auth()
+        if result is not None:
+            return result
+        if self.user_role not in {"owner", "manager", "operator"}:
+            return rx.redirect("/login")
+
+    async def require_operational_access_and_load_inventory(self) -> Any:
+        result = await self.require_operational_access()
+        if result is not None:
+            return result
+        return await self.load_inventory()
 
     async def require_admin_and_load_employees(self) -> Any:
         self.registration_feedback = ""
@@ -176,15 +223,26 @@ class AuthState(rx.State):
             return result
         await self.load_employees()
 
-    def logout(self) -> Any:
+    async def logout(self) -> Any:
+        token = self._auth_token
+        logout_error = False
+        if token:
+            try:
+                await logout(token)
+            except SupabaseApiError:
+                logout_error = True
         self._clear_session()
-        self.login_feedback = ""
+        self.login_feedback = (
+            "Não foi possível confirmar o encerramento da sessão."
+            if logout_error
+            else ""
+        )
         self.registration_feedback = ""
         return rx.redirect("/login")
 
     async def register_employee(self, form_data: dict[str, Any]) -> None:
         self.registration_feedback = ""
-        if self.user_role not in {"owner", "manager"}:
+        if self.user_role not in {"owner", "manager", "proprietario", "admin"}:
             self.registration_feedback = "Você não tem autorização para cadastrar funcionários."
             return
 
@@ -210,7 +268,7 @@ class AuthState(rx.State):
         try:
             await create_employee(self._auth_token, name, email, password, role)
             self.registration_feedback = "Funcionário cadastrado com sucesso."
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
             self.registration_feedback = self._error_message(error, "cadastrar o funcionário")
@@ -239,7 +297,7 @@ class AuthState(rx.State):
             return
         try:
             self.employees = await list_employees(self._auth_token)
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
             self.registration_feedback = self._error_message(
@@ -275,7 +333,7 @@ class AuthState(rx.State):
         return not self.employee_search.strip()
 
     def start_employee_edit(self, employee: dict[str, Any]) -> None:
-        self.employee_editing_id = int(employee.get("id", 0))
+        self.employee_editing_id = str(employee.get("id", ""))
         self.employee_form_name = str(employee.get("name", ""))
         self.employee_form_email = str(employee.get("email", ""))
         self.employee_form_role = str(employee.get("role", ""))
@@ -283,7 +341,7 @@ class AuthState(rx.State):
         self.registration_feedback = ""
 
     def cancel_employee_edit(self) -> None:
-        self.employee_editing_id = 0
+        self.employee_editing_id = ""
         self.employee_form_name = ""
         self.employee_form_email = ""
         self.employee_form_role = ""
@@ -333,7 +391,7 @@ class AuthState(rx.State):
             await self.load_employees()
             self.cancel_employee_edit()
             self.registration_feedback = "Funcionário atualizado com sucesso."
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
             self.registration_feedback = self._error_message(
@@ -346,11 +404,11 @@ class AuthState(rx.State):
         if self.employee_delete_busy:
             return
         try:
-            employee_id = int(employee.get("id", 0))
+            employee_id = str(employee.get("id", ""))
         except (TypeError, ValueError):
             self.registration_feedback = "Não foi possível identificar o funcionário."
             return
-        if employee_id <= 0 or not any(
+        if not employee_id or not any(
             str(record.get("id", "")) == str(employee_id)
             for record in self.employees
         ):
@@ -364,7 +422,7 @@ class AuthState(rx.State):
     def close_employee_delete(self) -> None:
         if self.employee_delete_busy:
             return
-        self.employee_delete_id = 0
+        self.employee_delete_id = ""
         self.employee_delete_name = ""
         self.employee_delete_open = False
 
@@ -376,7 +434,7 @@ class AuthState(rx.State):
             self.close_employee_delete()
             return
         employee_id = self.employee_delete_id
-        if not self._auth_token or employee_id <= 0:
+        if not self._auth_token or not employee_id:
             self.registration_feedback = "Sua sessão expirou. Faça login novamente."
             self.close_employee_delete()
             return
@@ -397,7 +455,7 @@ class AuthState(rx.State):
                 if str(employee.get("id", "")) != str(employee_id)
             ]
             self.registration_feedback = "Funcionário excluído com sucesso."
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
             if error.status_code == 404:
@@ -429,7 +487,7 @@ class AuthState(rx.State):
         self.product_codigo_de_barra = ""
 
     async def register_product(self) -> Any:
-        if self.user_role not in {"owner", "manager"}:
+        if self.user_role not in {"owner", "manager", "operator"}:
             return rx.toast.error(
                 "Você não tem autorização para cadastrar produtos."
             )
@@ -469,20 +527,18 @@ class AuthState(rx.State):
             )
             self._clear_product_form()
             return rx.toast.success("Produto cadastrado com sucesso.")
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
                 return rx.redirect("/login")
             if error.status_code in {400, 409}:
-                if "duplicate" in error.code.lower() or "unique" in error.message.lower():
+                if error.status_code == 409 or error.code == "23505":
                     return rx.toast.error(
                         "Já existe um produto com este código de barras."
                     )
-                return rx.toast.error(
-                    "Os dados do produto foram rejeitados pelo Xano."
-                )
+                return rx.toast.error("Os dados do produto foram rejeitados.")
             if error.status_code == 0:
-                return rx.toast.error("Não foi possível conectar ao Xano.")
+                return rx.toast.error("Não foi possível conectar ao Supabase.")
             return rx.toast.error(error.message)
         finally:
             self.is_busy = False
@@ -513,12 +569,6 @@ class AuthState(rx.State):
             if query in " ".join(record.values()).lower()
         ]
 
-    async def require_admin_and_load_inventory(self) -> Any:
-        result = await self.require_admin()
-        if result is not None:
-            return result
-        return await self.load_inventory()
-
     async def load_inventory(self) -> Any:
         if not self._auth_token:
             self._clear_session()
@@ -529,7 +579,7 @@ class AuthState(rx.State):
             products_by_id = {
                 product.get("id"): product
                 for product in products
-                if isinstance(product.get("id"), int)
+                if isinstance(product.get("id"), str)
             }
             self.inventory_records = [
                 {
@@ -548,7 +598,7 @@ class AuthState(rx.State):
                 }
                 for record in inventory
             ]
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
                 return rx.redirect("/login")
@@ -569,7 +619,7 @@ class AuthState(rx.State):
         return " ".join(product_name)
 
     async def add_inventory(self) -> Any:
-        if self.user_role not in {"owner", "manager"}:
+        if self.user_role not in {"owner", "manager", "operator"}:
             return rx.toast.error(
                 "Você não tem autorização para atualizar o estoque."
             )
@@ -591,49 +641,23 @@ class AuthState(rx.State):
 
         self.is_busy = True
         try:
-            async with INVENTORY_OPERATION_LOCK:
-                products = await list_products(self._auth_token)
-                product = next(
-                    (
-                        item
-                        for item in products
-                        if item.get("codigo_de_barra") == codigo
-                    ),
-                    None,
-                )
-                if product is None or not isinstance(product.get("id"), int):
-                    return rx.toast.error("Nenhum produto encontrado para este código.")
-
-                inventory = await list_inventory(self._auth_token)
-                existing = find_inventory_record(inventory, product["id"], validade)
-                if existing is not None and isinstance(existing.get("id"), int):
-                    current_units = parse_inventory_units(
-                        str(existing.get("unidades", ""))
-                    )
-                    if current_units is None:
-                        return rx.toast.error(
-                            "O Xano retornou uma quantidade inválida no estoque."
-                        )
-                    await update_inventory_lot(
-                        self._auth_token,
-                        existing["id"],
-                        current_units + unidades,
-                    )
-                else:
-                    await create_inventory_lot(
-                        self._auth_token,
-                        product["id"],
-                        unidades,
-                        validade,
-                        lote,
-                    )
-                self.conference_codigo = ""
-                self.conference_lote = ""
-                self.conference_unidades = ""
-                self.conference_validade = ""
-                await self.load_inventory()
-                return rx.toast.success("Estoque atualizado com sucesso.")
-        except XanoApiError as error:
+            product = await find_product_by_barcode(self._auth_token, codigo)
+            if product is None:
+                return rx.toast.error("Nenhum produto encontrado para este código.")
+            await create_inventory_lot(
+                self._auth_token,
+                str(product["id"]),
+                unidades,
+                validade,
+                lote,
+            )
+            self.conference_codigo = ""
+            self.conference_lote = ""
+            self.conference_unidades = ""
+            self.conference_validade = ""
+            await self.load_inventory()
+            return rx.toast.success("Estoque atualizado com sucesso.")
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
                 return rx.redirect("/login")
@@ -1219,52 +1243,7 @@ def dashboard_cards() -> rx.Component:
 
 
 class PricesState(rx.State):
-    mock_products: list[dict[str, str]] = [
-        {
-            "product": "Salgadinho Doritos 37 g",
-            "barcode": "7892840816469",
-            "type": "Salgadinho",
-            "brand": "Doritos",
-            "weight": "37 g",
-        },
-        {
-            "product": "Arroz Tio Urbano 5000 g",
-            "barcode": "7896290300011",
-            "type": "Arroz",
-            "brand": "Tio Urbano",
-            "weight": "5000 g",
-        },
-        {
-            "product": "Margarina Qualy 500 g",
-            "barcode": "7891000205023",
-            "type": "Margarina",
-            "brand": "Qualy",
-            "weight": "500 g",
-        },
-    ]
-    mock_prices: list[dict[str, str]] = [
-        {
-            "product": "Salgadinho Doritos 37 g",
-            "barcode": "7892840816469",
-            "brand": "Doritos",
-            "price": "R$ 5,99",
-            "date": "16/10/2026",
-        },
-        {
-            "product": "Arroz Tio Urbano 5000 g",
-            "barcode": "7896290300011",
-            "brand": "Tio Urbano",
-            "price": "R$ 24,90",
-            "date": "16/10/2026",
-        },
-        {
-            "product": "Margarina Qualy 500 g",
-            "barcode": "7891000205023",
-            "brand": "Qualy",
-            "price": "R$ 8,49",
-            "date": "16/10/2026",
-        },
-    ]
+    prices: list[dict[str, str]] = []
     barcode_input: str = ""
     price_input: str = ""
     price_search_input: str = ""
@@ -1283,13 +1262,61 @@ class PricesState(rx.State):
     def set_price_search_input(self, value: str) -> None:
         self.price_search_input = value
 
-    def search_mock_product(self) -> None:
+    async def _authorized_token(self) -> tuple[str | None, Any]:
+        auth_state = await self.get_state(AuthState)
+        redirect = await auth_state.require_admin()
+        if redirect is not None:
+            return None, redirect
+        return auth_state._auth_token, None
+
+    async def load_prices(self) -> Any:
+        token, redirect = await self._authorized_token()
+        if redirect is not None:
+            return redirect
+        if not token:
+            return rx.redirect("/login")
+        try:
+            rows = await list_current_prices(token)
+            self.prices = [self._format_price_row(row) for row in rows]
+            self.feedback = ""
+            self.feedback_is_error = False
+        except SupabaseApiError as error:
+            self.feedback = error.message
+            self.feedback_is_error = True
+
+    async def search_product(self) -> Any:
+        token, redirect = await self._authorized_token()
+        if redirect is not None:
+            return redirect
+        if not token:
+            return rx.redirect("/login")
         barcode = self.barcode_input.strip()
-        product = next(
-            (item for item in self.mock_products if item["barcode"] == barcode),
-            None,
-        )
-        self.selected_product = product or {}
+        if not barcode:
+            self.selected_product = {}
+            self.has_selected_product = False
+            self.feedback = "Informe um código de barras para pesquisar."
+            self.feedback_is_error = True
+            return
+        try:
+            product = await find_product_by_barcode(token, barcode)
+            self.selected_product = (
+                {
+                    "id": str(product["id"]),
+                    "product": self._product_name(product),
+                    "barcode": str(product["codigo_de_barra"]),
+                    "type": str(product["tipo"]),
+                    "brand": str(product["marca"]),
+                    "weight": f'{product["peso"]:g} g',
+                }
+                if product is not None
+                else {}
+            )
+        except SupabaseApiError as error:
+            self.selected_product = {}
+            self.has_selected_product = False
+            self.feedback = error.message
+            self.feedback_is_error = True
+            return
         self.has_selected_product = product is not None
         self.feedback = (
             "Produto encontrado."
@@ -1298,62 +1325,84 @@ class PricesState(rx.State):
         )
         self.feedback_is_error = product is None
 
-    def link_mock_price(self) -> None:
+    @staticmethod
+    def _product_name(product: dict[str, Any]) -> str:
+        return " ".join(
+            (
+                str(product["tipo"]).strip(),
+                str(product["marca"]).strip(),
+                f'{product["peso"]:g} g',
+            )
+        )
+
+    @staticmethod
+    def _format_price_row(row: dict[str, Any]) -> dict[str, str]:
+        cents = int(row["price_cents"])
+        amount = f"{cents // 100},{cents % 100:02d}"
+        timestamp = str(row["price_created_at"])
+        try:
+            registered_at = datetime.fromisoformat(
+                timestamp.replace("Z", "+00:00")
+            ).strftime("%d/%m/%Y")
+        except ValueError as error:
+            raise SupabaseApiError(
+                502,
+                "invalid_response",
+                "O Supabase retornou uma data de preço inválida.",
+            ) from error
+        return {
+            "product": str(row["product_name"]),
+            "barcode": str(row["barcode"]),
+            "brand": str(row["brand"]),
+            "price": f"R$ {amount}",
+            "date": registered_at,
+            "search": " ".join(
+                (
+                    str(row["product_name"]),
+                    str(row["barcode"]),
+                    str(row["brand"]),
+                )
+            ).casefold(),
+        }
+
+    async def save_price(self) -> Any:
         if not self.has_selected_product:
             self.feedback = "Pesquise um produto pelo código de barras primeiro."
             self.feedback_is_error = True
             return
 
-        try:
-            price = Decimal(self.price_input.strip().replace(",", "."))
-        except InvalidOperation:
-            price = Decimal("0")
-        if not price.is_finite() or price <= 0:
+        price_cents = validate_price_cents(self.price_input)
+        if price_cents is None:
             self.feedback = "Digite um preço válido."
             self.feedback_is_error = True
             return
 
-        product = self.selected_product
-        formatted_price = f"R$ {price:.2f}".replace(".", ",")
-        updated = {
-            "product": product["product"],
-            "barcode": product["barcode"],
-            "brand": product["brand"],
-            "price": formatted_price,
-            "date": "16/10/2026",
-        }
-        existing_index = next(
-            (
-                index
-                for index, record in enumerate(self.mock_prices)
-                if record["barcode"] == product["barcode"]
-            ),
-            None,
-        )
-        if existing_index is None:
-            self.mock_prices = [updated, *self.mock_prices]
-        else:
-            self.mock_prices[existing_index] = updated
-            self.mock_prices = list(self.mock_prices)
-        self.feedback = "Preço vinculado localmente."
-        self.feedback_is_error = False
-        self.price_input = ""
+        token, redirect = await self._authorized_token()
+        if redirect is not None:
+            return redirect
+        if not token:
+            return rx.redirect("/login")
+        try:
+            await create_product_price(
+                token,
+                self.selected_product["id"],
+                price_cents,
+            )
+            await self.load_prices()
+            if not self.feedback_is_error:
+                self.feedback = "Preço vinculado com sucesso."
+                self.feedback_is_error = False
+                self.price_input = ""
+        except SupabaseApiError as error:
+            self.feedback = error.message
+            self.feedback_is_error = True
 
-    def search_mock_prices(self) -> None:
+    def search_prices(self) -> None:
         self.applied_price_search = self.price_search_input.strip().casefold()
 
     @rx.var
-    def filtered_mock_prices(self) -> list[dict[str, str]]:
-        query = self.applied_price_search
-        if not query:
-            return self.mock_prices
-        return [
-            price
-            for price in self.mock_prices
-            if query in price["product"].casefold()
-            or query in price["barcode"].casefold()
-            or query in price["brand"].casefold()
-        ]
+    def filtered_prices(self) -> list[dict[str, str]]:
+        return filter_prices(self.prices, self.applied_price_search)
 
 
 def prices_table_row(price: dict[str, str]) -> rx.Component:
@@ -1433,7 +1482,7 @@ def prices_panel() -> rx.Component:
                             rx.button(
                                 rx.icon("search", size=19),
                                 aria_label="Pesquisar código de barras",
-                                on_click=PricesState.search_mock_product,
+                                on_click=PricesState.search_product,
                                 width="3.1rem",
                                 min_width="3.1rem",
                                 **primary_button_style,
@@ -1463,7 +1512,7 @@ def prices_panel() -> rx.Component:
                 rx.button(
                     "Vincular Preço",
                     type="button",
-                    on_click=PricesState.link_mock_price,
+                    on_click=PricesState.save_price,
                     width="100%",
                     **primary_button_style,
                 ),
@@ -1550,7 +1599,7 @@ def prices_panel() -> rx.Component:
                     rx.button(
                         rx.hstack(rx.text("Consultar"), rx.icon("search", size=18), gap="0.5rem"),
                         type="button",
-                        on_click=PricesState.search_mock_prices,
+                        on_click=PricesState.search_prices,
                         **primary_button_style,
                         padding="0 1.2rem",
                     ),
@@ -1574,8 +1623,8 @@ def prices_panel() -> rx.Component:
                 ),
                 rx.box(
                     rx.cond(
-                        PricesState.filtered_mock_prices.length() > 0,
-                        rx.foreach(PricesState.filtered_mock_prices, prices_table_row),
+                        PricesState.filtered_prices.length() > 0,
+                        rx.foreach(PricesState.filtered_prices, prices_table_row),
                         rx.text(
                             "Nenhum preço encontrado.",
                             color="#5B6475",
@@ -1846,7 +1895,7 @@ def registration_form_panel() -> rx.Component:
         rx.vstack(
             rx.heading(
                 rx.cond(
-                    AuthState.employee_editing_id > 0,
+                    AuthState.employee_editing_id != "",
                     "Editar Funcionário",
                     "Adicionar Funcionário",
                 ),
@@ -1880,7 +1929,7 @@ def registration_form_panel() -> rx.Component:
                     type="password",
                     name="password",
                     placeholder=rx.cond(
-                        AuthState.employee_editing_id > 0,
+                        AuthState.employee_editing_id != "",
                         "Nova senha (opcional)",
                         "Digite a senha desejada",
                     ),
@@ -1903,7 +1952,7 @@ def registration_form_panel() -> rx.Component:
                 ),
                 rx.button(
                     rx.cond(
-                        AuthState.employee_editing_id > 0,
+                        AuthState.employee_editing_id != "",
                         "Salvar alterações",
                         "Cadastrar Funcionário",
                     ),
@@ -1947,7 +1996,7 @@ def registration_form_panel() -> rx.Component:
                 reset_on_submit=False,
             ),
             rx.cond(
-                AuthState.employee_editing_id > 0,
+                AuthState.employee_editing_id != "",
                 rx.button(
                     "Cancelar edição",
                     type="button",
@@ -2605,7 +2654,7 @@ def dashboard_layout(
     )
 
 
-@rx.page(route="/", on_load=AuthState.require_auth)
+@rx.page(route="/", on_load=AuthState.require_admin)
 def dashboard() -> rx.Component:
     return dashboard_layout(
         dashboard_cards(),
@@ -2624,7 +2673,7 @@ def registration_page() -> rx.Component:
     )
 
 
-@rx.page(route="/estoque", on_load=AuthState.require_admin_and_load_inventory)
+@rx.page(route="/estoque", on_load=AuthState.require_operational_access_and_load_inventory)
 def estoque_page() -> rx.Component:
     return dashboard_layout(
         inventory_panel(),
@@ -2633,7 +2682,7 @@ def estoque_page() -> rx.Component:
     )
 
 
-@rx.page(route="/conferencia", on_load=AuthState.require_admin)
+@rx.page(route="/conferencia", on_load=AuthState.require_operational_access)
 def conferencia_page() -> rx.Component:
     return dashboard_layout(
         conference_form_panel(),
@@ -2642,7 +2691,7 @@ def conferencia_page() -> rx.Component:
     )
 
 
-@rx.page(route="/produtos", on_load=AuthState.require_admin)
+@rx.page(route="/produtos", on_load=AuthState.require_operational_access)
 def produtos_page() -> rx.Component:
     return dashboard_layout(
         product_form_panel(),
@@ -2660,7 +2709,7 @@ def relatorios_page() -> rx.Component:
     )
 
 
-@rx.page(route="/precos", on_load=AuthState.require_admin)
+@rx.page(route="/precos", on_load=PricesState.load_prices)
 def precos_page() -> rx.Component:
     return dashboard_layout(
         prices_panel(),

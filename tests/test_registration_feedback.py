@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from bipsystem.auth_client import XanoApiError
+from bipsystem.auth_client import SupabaseApiError
 from bipsystem.bipsystem import AuthState
 
 
@@ -31,13 +31,28 @@ class RegistrationFeedbackLoadTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "bipsystem.bipsystem.list_employees",
-            new=AsyncMock(return_value=[{"id": 1, "name": "Ana"}]),
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "id": "d1e35c87-9f35-4b23-9e36-a6b2f7f45ef0",
+                        "name": "Ana",
+                    }
+                ]
+            ),
         ) as list_mock:
             await AuthState.require_admin_and_load_employees.fn(state)
 
         state.require_admin.assert_awaited_once()
         list_mock.assert_awaited_once_with("token")
-        self.assertEqual(state.employees, [{"id": 1, "name": "Ana"}])
+        self.assertEqual(
+            state.employees,
+            [
+                {
+                    "id": "d1e35c87-9f35-4b23-9e36-a6b2f7f45ef0",
+                    "name": "Ana",
+                }
+            ],
+        )
         self.assertEqual(state.registration_feedback, "")
 
     async def test_empty_employee_list_does_not_show_feedback(self) -> None:
@@ -57,7 +72,7 @@ class RegistrationFeedbackLoadTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "bipsystem.bipsystem.list_employees",
-            new=AsyncMock(side_effect=XanoApiError(500)),
+            new=AsyncMock(side_effect=SupabaseApiError(500)),
         ):
             await AuthState.require_admin_and_load_employees.fn(state)
 

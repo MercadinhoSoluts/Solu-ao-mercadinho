@@ -17,10 +17,26 @@ def session_state(**values: object) -> SimpleNamespace:
         "_auth_token": "",
         "_refresh_token": "",
         "_token_expires_at": 0.0,
+        "cashier_navigation_started": False,
+        "cashier_purchase_id": "",
+        "cashier_open_request_id": "",
+        "cashier_purchase_status": "",
+        "cashier_items": [],
+        "cashier_total_display": "0,00 R$",
+        "cashier_barcode": "",
+        "cashier_quantity": "1",
+        "cashier_entry_open": True,
+        "cashier_feedback": "",
+        "cashier_busy": False,
+        "cashier_cancel_confirmation_open": False,
+        "cashier_pending_request_id": "",
+        "cashier_pending_barcode": "",
+        "cashier_pending_quantity": 0,
     }
     defaults.update(values)
     state = SimpleNamespace(**defaults)
     state._clear_session = lambda: AuthState._clear_session(state)
+    state._clear_cashier_purchase = lambda: AuthState._clear_cashier_purchase(state)
     state._set_session = lambda session: AuthState._set_session(state, session)
     state._set_user = lambda user: AuthState._set_user(state, user)
     state.get_post_login_redirect = AuthState.get_post_login_redirect
@@ -48,12 +64,13 @@ class AuthStateSessionTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=user),
             ),
         ):
-            await AuthState.submit.fn(
+            result = await AuthState.submit.fn(
                 state,
                 {"user": "ANA@example.com", "senha": "SenhaSegura123!"},
             )
 
         self.assertTrue(state.authenticated)
+        self.assertEqual(result.args[0][1]._var_value, "/caixa-inicio")
         self.assertEqual(state._auth_token, "access-token")
         self.assertEqual(state._refresh_token, "refresh-token")
         self.assertEqual(state.user_role, "operator")

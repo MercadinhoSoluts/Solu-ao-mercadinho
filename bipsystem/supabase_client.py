@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 from urllib.parse import urlsplit
 
 import httpx
@@ -37,6 +37,7 @@ def _get_public_configuration() -> tuple[str, str]:
 @asynccontextmanager
 async def request_supabase_client(
     access_token: str | None = None,
+    response_observer: Callable[[httpx.Response], None] | None = None,
 ) -> AsyncIterator[AsyncClient]:
     url, anon_key = _get_public_configuration()
     headers: dict[str, str] = {}
@@ -45,7 +46,14 @@ async def request_supabase_client(
             raise SupabaseSessionError("A non-empty Supabase access token is required.")
         headers["Authorization"] = f"Bearer {access_token}"
 
-    async with httpx.AsyncClient(timeout=10.0) as http_client:
+    client_options: dict[str, object] = {"timeout": 10.0}
+    if response_observer is not None:
+        async def observe_response(response: httpx.Response) -> None:
+            response_observer(response)
+
+        client_options["event_hooks"] = {"response": [observe_response]}
+
+    async with httpx.AsyncClient(**client_options) as http_client:
         options = AsyncClientOptions(
             headers=headers,
             auto_refresh_token=False,

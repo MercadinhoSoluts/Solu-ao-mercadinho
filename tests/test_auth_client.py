@@ -51,8 +51,8 @@ class RoleAndValidationTests(unittest.TestCase):
         self.assertIsNone(validate_price_cents("NaN"))
 
     def test_post_login_redirect_uses_business_role_mapping(self) -> None:
-        self.assertEqual(AuthState.get_post_login_redirect("caixa"), "/caixa")
-        self.assertEqual(AuthState.get_post_login_redirect("operator"), "/caixa")
+        self.assertEqual(AuthState.get_post_login_redirect("caixa"), "/caixa-inicio")
+        self.assertEqual(AuthState.get_post_login_redirect("operator"), "/caixa-inicio")
         self.assertEqual(AuthState.get_post_login_redirect("proprietario"), "/")
         self.assertEqual(AuthState.get_post_login_redirect("admin"), "/")
         self.assertIsNone(AuthState.get_post_login_redirect("unknown"))

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -8,6 +10,7 @@ from math import isfinite
 from time import time
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import httpx
 from postgrest.exceptions import APIError
@@ -20,6 +23,7 @@ from bipsystem.supabase_client import (
 
 
 SUPPORTED_ROLES = {"owner", "manager", "operator"}
+logger = logging.getLogger(__name__)
 ROLE_ALIASES = {
     "admin": "manager",
     "administrador": "manager",
@@ -118,32 +122,117 @@ def validate_password(password: str) -> str | None:
     return None
 
 
-def _translate_error(error: APIError | AuthApiError) -> SupabaseApiError:
+def _translate_error(
+    error: APIError | AuthApiError,
+    http_status: int | None = None,
+) -> SupabaseApiError:
     error_code = str(getattr(error, "code", "") or "")
-    status = getattr(error, "status", None)
-    if status is None:
-        status = getattr(error, "status_code", None)
-    if status is None:
+    raw_status = getattr(error, "status", None)
+    if raw_status is None:
+        raw_status = getattr(error, "status_code", None)
+    if raw_status is None:
+        raw_status = http_status
+    try:
+        status = int(raw_status)
+    except (TypeError, ValueError):
         status = 400 if isinstance(error, AuthApiError) else 500
 
     if error_code in {"23505", "email_exists"}:
         status = 409
     elif error_code == "42501":
         status = 403
+    elif error_code in {"PGRST301", "PGRST302", "PGRST303"}:
+        status = 401
+    elif error_code in {"P1003", "P1007", "P1010", "P1011"}:
+        status = 409
+    elif error_code in {"P1001", "P1002", "P1004"}:
+        status = 404
+    elif error_code in {"P1005", "P1006"}:
+        status = 400
+    elif error_code == "P1008":
+        status = 500
     elif error_code.startswith(("22", "23")):
         status = 400
 
+    schema_errors = {
+        "PGRST202",
+        "PGRST204",
+        "PGRST205",
+        "42P01",
+        "42703",
+        "42883",
+        "42804",
+    }
+    purchase_messages = {
+        "P1001": "Este código de barras não pertence a um produto ativo.",
+        "P1002": "Este produto não possui um preço vigente.",
+        "P1003": "A compra não está aberta para alterações.",
+        "P1004": "A compra não foi encontrada.",
+        "P1005": "Adicione pelo menos um item antes de finalizar a compra.",
+        "P1006": "A quantidade deve ser um número inteiro maior que zero.",
+        "P1007": "Esta solicitação já foi usada com outros dados.",
+        "P1010": "Estoque insuficiente para concluir a venda. Verifique os saldos e tente novamente.",
+        "P1011": "A compra já foi finalizada com outro método de pagamento.",
+        "PGRST202": (
+            "O serviço de abertura de compras não está disponível no Supabase. "
+            "Verifique a implantação da migration."
+        ),
+        "PGRST204": (
+            "O schema do Supabase não corresponde à versão desta aplicação. "
+            "Contate o suporte."
+        ),
+        "PGRST205": (
+            "As tabelas de compras não estão disponíveis no Supabase. "
+            "Verifique a implantação da migration."
+        ),
+        "42P01": (
+            "A estrutura de compras não existe no Supabase. "
+            "Verifique a implantação da migration."
+        ),
+        "42703": (
+            "O schema do Supabase não corresponde à versão desta aplicação. "
+            "Contate o suporte."
+        ),
+        "42883": (
+            "A função de compras não está disponível no Supabase. "
+            "Verifique a implantação da migration."
+        ),
+        "42804": (
+            "Os dados enviados não correspondem aos tipos definidos no "
+            "Supabase. Contate o suporte."
+        ),
+    }
     safe_messages = {
         400: "Verifique os dados informados e tente novamente.",
-        401: "Sessão inválida ou expirada.",
+        401: "Sua sessão expirou ou não é mais válida. Entre novamente.",
         403: "Você não tem autorização para realizar esta ação.",
         409: "Já existe um registro com esses dados.",
+        404: "O recurso solicitado não foi encontrado no Supabase.",
+        500: "O Supabase encontrou um erro interno ao processar a operação.",
     }
+    if error_code in schema_errors:
+        status = 503 if error_code.startswith("PGRST") else 500
     return SupabaseApiError(
         int(status),
         error_code,
-        safe_messages.get(int(status), "O Supabase não conseguiu concluir a operação."),
+        purchase_messages.get(
+            error_code,
+            safe_messages.get(int(status), "O Supabase não conseguiu concluir a operação."),
+        ),
     )
+
+
+def _redact_diagnostic(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(
+        r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", text)
+    text = re.sub(r"\bsb_(?:secret|publishable)_[A-Za-z0-9_-]+", "[REDACTED]", text)
+    text = re.sub(r"\beyJ[A-Za-z0-9_.-]{20,}", "[REDACTED]", text)
+    return text[:1000]
 
 
 def _session_from_response(response: Any) -> AuthSession:
@@ -616,6 +705,71 @@ async def list_inventory(token: str) -> list[dict[str, Any]]:
         raise SupabaseApiError(500, "configuration_error", str(error)) from error
 
 
+async def get_available_stock(
+    token: str,
+    product_id: str,
+    business_date: str,
+) -> int:
+    try:
+        normalized_product_id = str(UUID(product_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(
+            400,
+            "invalid_product_id",
+            "O produto informado é inválido.",
+        ) from error
+    if parse_inventory_date(business_date) is None:
+        raise SupabaseApiError(
+            400,
+            "invalid_business_date",
+            "A data para consulta do estoque é inválida.",
+        )
+
+    try:
+        async with request_supabase_client(token) as client:
+            response = await (
+                client.table("stock_lots")
+                .select("units")
+                .eq("product_id", normalized_product_id)
+                .gte("expires_on", business_date)
+                .execute()
+            )
+        rows = response.data
+        if not isinstance(rows, list):
+            raise SupabaseApiError(
+                502,
+                "invalid_response",
+                "O Supabase retornou um saldo de estoque inválido.",
+            )
+        units = [row["units"] for row in rows]
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in units
+        ):
+            raise ValueError("Invalid stock lot units")
+        return sum(units)
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
+    except (KeyError, TypeError, ValueError) as error:
+        raise SupabaseApiError(
+            502,
+            "invalid_response",
+            "O Supabase retornou dados de estoque inválidos.",
+        ) from error
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível consultar o estoque no Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
 async def create_inventory_lot(
     token: str,
     produtos_id: str,
@@ -775,6 +929,252 @@ async def list_current_prices(token: str) -> list[dict[str, Any]]:
         ) from error
     except SupabaseConfigurationError as error:
         raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
+def _purchase_from_rpc(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise SupabaseApiError(
+            502,
+            "invalid_response",
+            "O Supabase retornou uma compra inválida.",
+        )
+    try:
+        purchase_id = str(UUID(str(value["id"])))
+        status = value["status"]
+        total_cents = value["total_cents"]
+        payment_method = value.get("payment_method")
+        raw_items = value["items"]
+        if (
+            not isinstance(status, str)
+            or status not in {"open", "completed", "cancelled"}
+            or (
+                payment_method is not None
+                and (
+                    not isinstance(payment_method, str)
+                    or payment_method
+                    not in {"credit_card", "debit_card", "pix", "cash"}
+                )
+            )
+            or isinstance(total_cents, bool)
+            or not isinstance(total_cents, int)
+            or total_cents < 0
+            or not isinstance(raw_items, list)
+        ):
+            raise ValueError("Invalid purchase fields")
+
+        items = []
+        for row in raw_items:
+            if not isinstance(row, dict):
+                raise ValueError("Invalid purchase item")
+            quantity = row["quantity"]
+            unit_price_cents = row["unit_price_cents"]
+            line_total_cents = row["line_total_cents"]
+            if (
+                isinstance(quantity, bool)
+                or not isinstance(quantity, int)
+                or quantity <= 0
+                or isinstance(unit_price_cents, bool)
+                or not isinstance(unit_price_cents, int)
+                or unit_price_cents <= 0
+                or isinstance(line_total_cents, bool)
+                or not isinstance(line_total_cents, int)
+                or line_total_cents != quantity * unit_price_cents
+            ):
+                raise ValueError("Invalid purchase item totals")
+            item_id = str(UUID(str(row["id"])))
+            product_name = row["product_name"]
+            barcode = row["barcode"]
+            if (
+                not isinstance(product_name, str)
+                or not isinstance(barcode, str)
+                or not product_name.strip()
+                or not barcode.strip()
+            ):
+                raise ValueError("Invalid purchase item description")
+            items.append(
+                {
+                    "id": item_id,
+                    "product_name": product_name,
+                    "barcode": barcode,
+                    "quantity": quantity,
+                    "unit_price_cents": unit_price_cents,
+                    "line_total_cents": line_total_cents,
+                }
+            )
+        if sum(item["line_total_cents"] for item in items) != total_cents:
+            raise ValueError("Purchase total does not match its items")
+    except (KeyError, TypeError, ValueError) as error:
+        raise SupabaseApiError(
+            502,
+            "invalid_response",
+            "O Supabase retornou dados de compra incompletos ou inconsistentes.",
+        ) from error
+
+    return {
+        "id": purchase_id,
+        "status": status,
+        "total_cents": total_cents,
+        "payment_method": payment_method,
+        "items": items,
+    }
+
+
+async def _cashier_purchase_rpc(
+    token: str,
+    function_name: str,
+    parameters: dict[str, Any],
+) -> dict[str, Any]:
+    http_status: int | None = None
+
+    def observe_response(response: httpx.Response) -> None:
+        nonlocal http_status
+        http_status = response.status_code
+
+    try:
+        async with request_supabase_client(
+            token,
+            response_observer=observe_response,
+        ) as client:
+            response = await client.rpc(function_name, parameters).execute()
+        return _purchase_from_rpc(response.data)
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        translated = _translate_error(error, http_status=http_status)
+        logger.error(
+            "Cashier Supabase RPC failed: function=%s http_status=%s "
+            "code=%s message=%s details=%s hint=%s",
+            function_name,
+            http_status
+            or getattr(error, "status", None)
+            or getattr(error, "status_code", None)
+            or "unavailable",
+            _redact_diagnostic(getattr(error, "code", "")),
+            _redact_diagnostic(getattr(error, "message", str(error))),
+            _redact_diagnostic(getattr(error, "details", "")),
+            _redact_diagnostic(getattr(error, "hint", "")),
+        )
+        raise translated from error
+    except httpx.RequestError as error:
+        logger.error(
+            "Cashier Supabase RPC connection failed: function=%s error_type=%s",
+            function_name,
+            type(error).__name__,
+        )
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível conectar ao Supabase para atualizar a compra.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        logger.error(
+            "Cashier Supabase RPC configuration failed: function=%s error=%s",
+            function_name,
+            _redact_diagnostic(error),
+        )
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
+async def open_cashier_purchase(token: str, request_id: str) -> dict[str, Any]:
+    try:
+        normalized_request_id = str(UUID(request_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(400, "invalid_request_id", "Solicitação inválida.") from error
+    return await _cashier_purchase_rpc(
+        token,
+        "open_cashier_purchase",
+        {"p_open_request_id": normalized_request_id},
+    )
+
+
+async def get_cashier_purchase(token: str, purchase_id: str) -> dict[str, Any]:
+    try:
+        normalized_purchase_id = str(UUID(purchase_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(400, "invalid_purchase_id", "Compra inválida.") from error
+    return await _cashier_purchase_rpc(
+        token,
+        "get_cashier_purchase",
+        {"p_purchase_id": normalized_purchase_id},
+    )
+
+
+async def add_cashier_purchase_item(
+    token: str,
+    purchase_id: str,
+    barcode: str,
+    quantity: int,
+    request_id: str,
+) -> dict[str, Any]:
+    try:
+        normalized_purchase_id = str(UUID(purchase_id))
+        normalized_request_id = str(UUID(request_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(400, "invalid_request_id", "Solicitação inválida.") from error
+    if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
+        raise SupabaseApiError(
+            400,
+            "invalid_quantity",
+            "A quantidade deve ser um número inteiro maior que zero.",
+        )
+    if not isinstance(barcode, str):
+        raise SupabaseApiError(400, "invalid_barcode", "Informe o código de barras.")
+    normalized_barcode = barcode.strip()
+    if not normalized_barcode:
+        raise SupabaseApiError(400, "invalid_barcode", "Informe o código de barras.")
+    return await _cashier_purchase_rpc(
+        token,
+        "add_cashier_purchase_item",
+        {
+            "p_purchase_id": normalized_purchase_id,
+            "p_barcode": normalized_barcode,
+            "p_quantity": quantity,
+            "p_request_id": normalized_request_id,
+        },
+    )
+
+
+async def complete_cashier_purchase(
+    token: str,
+    purchase_id: str,
+    payment_method: str,
+) -> dict[str, Any]:
+    try:
+        normalized_purchase_id = str(UUID(purchase_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(400, "invalid_purchase_id", "Compra inválida.") from error
+    if (
+        not isinstance(payment_method, str)
+        or payment_method not in {"credit_card", "debit_card", "pix", "cash"}
+    ):
+        raise SupabaseApiError(
+            400,
+            "invalid_payment_method",
+            "Selecione um método de pagamento válido.",
+        )
+    return await _cashier_purchase_rpc(
+        token,
+        "complete_cashier_purchase",
+        {
+            "p_purchase_id": normalized_purchase_id,
+            "p_payment_method": payment_method,
+        },
+    )
+
+
+async def cancel_cashier_purchase(
+    token: str,
+    purchase_id: str,
+) -> dict[str, Any]:
+    try:
+        normalized_purchase_id = str(UUID(purchase_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(400, "invalid_purchase_id", "Compra inválida.") from error
+    return await _cashier_purchase_rpc(
+        token,
+        "cancel_cashier_purchase",
+        {"p_purchase_id": normalized_purchase_id},
+    )
 
 
 def parse_inventory_units(value: str) -> int | None:

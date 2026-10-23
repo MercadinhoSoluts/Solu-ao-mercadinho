@@ -2,6 +2,8 @@ import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+
 from bipsystem.supabase_client import (
     SupabaseConfigurationError,
     SupabaseSessionError,
@@ -86,6 +88,45 @@ class SupabaseClientConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(options.persist_session)
         self.assertFalse(options.auto_refresh_token)
         self.assertIs(options.httpx_client, fake_httpx_client)
+
+    async def test_request_client_observes_response_only_when_requested(self) -> None:
+        fake_httpx_client = object()
+        httpx_context = MagicMock()
+        httpx_context.__aenter__ = AsyncMock(return_value=fake_httpx_client)
+        httpx_context.__aexit__ = AsyncMock(return_value=None)
+        observed_statuses: list[int] = []
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "SUPABASE_URL": "https://example.supabase.co",
+                    "SUPABASE_ANON_KEY": "public-key",
+                },
+                clear=True,
+            ),
+            patch(
+                "bipsystem.supabase_client.create_async_client",
+                new_callable=AsyncMock,
+                return_value=object(),
+            ),
+            patch(
+                "bipsystem.supabase_client.httpx.AsyncClient",
+                return_value=httpx_context,
+            ) as httpx_client_factory,
+        ):
+            async with request_supabase_client(
+                "user-access-token",
+                response_observer=lambda response: observed_statuses.append(
+                    response.status_code
+                ),
+            ):
+                pass
+
+        kwargs = httpx_client_factory.call_args.kwargs
+        self.assertEqual(kwargs["timeout"], 10.0)
+        response_hook = kwargs["event_hooks"]["response"][0]
+        await response_hook(httpx.Response(403))
+        self.assertEqual(observed_statuses, [403])
 
     async def test_public_client_does_not_set_a_user_authorization_header(self) -> None:
         fake_httpx_client = object()

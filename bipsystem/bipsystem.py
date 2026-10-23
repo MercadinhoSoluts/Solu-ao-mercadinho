@@ -3,7 +3,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 import reflex as rx
@@ -34,6 +35,14 @@ from bipsystem.auth_client import (
     validate_password,
     update_employee,
 )
+
+
+def format_weight_grams(value: Any) -> str:
+    weight = format(Decimal(str(value)), "f")
+    if "." in weight:
+        weight = weight.rstrip("0").rstrip(".")
+    return f"{weight} g"
+
 
 def filter_prices(
     prices: list[dict[str, str]],
@@ -615,7 +624,7 @@ class AuthState(rx.State):
         ]
         weight = str(product.get("peso", "")).strip()
         if weight:
-            product_name.append(f"{weight} g")
+            product_name.append(format_weight_grams(weight))
         return " ".join(product_name)
 
     async def add_inventory(self) -> Any:
@@ -1252,15 +1261,26 @@ class PricesState(rx.State):
     has_selected_product: bool = False
     feedback: str = ""
     feedback_is_error: bool = False
+    saving_price: bool = False
 
     def set_barcode_input(self, value: str) -> None:
+        if self.saving_price:
+            return
         self.barcode_input = value
+        self.selected_product = {}
+        self.has_selected_product = False
+        self.feedback = ""
+        self.feedback_is_error = False
 
     def set_price_input(self, value: str) -> None:
         self.price_input = value
 
     def set_price_search_input(self, value: str) -> None:
         self.price_search_input = value
+        self.applied_price_search = value
+
+    def search_prices(self) -> None:
+        self.applied_price_search = self.price_search_input
 
     async def _authorized_token(self) -> tuple[str | None, Any]:
         auth_state = await self.get_state(AuthState)
@@ -1285,6 +1305,10 @@ class PricesState(rx.State):
             self.feedback_is_error = True
 
     async def search_product(self) -> Any:
+        if self.saving_price:
+            return
+        self.selected_product = {}
+        self.has_selected_product = False
         token, redirect = await self._authorized_token()
         if redirect is not None:
             return redirect
@@ -1306,7 +1330,7 @@ class PricesState(rx.State):
                     "barcode": str(product["codigo_de_barra"]),
                     "type": str(product["tipo"]),
                     "brand": str(product["marca"]),
-                    "weight": f'{product["peso"]:g} g',
+                    "weight": format_weight_grams(product["peso"]),
                 }
                 if product is not None
                 else {}
@@ -1331,7 +1355,7 @@ class PricesState(rx.State):
             (
                 str(product["tipo"]).strip(),
                 str(product["marca"]).strip(),
-                f'{product["peso"]:g} g',
+                format_weight_grams(product["peso"]),
             )
         )
 
@@ -1340,10 +1364,20 @@ class PricesState(rx.State):
         cents = int(row["price_cents"])
         amount = f"{cents // 100},{cents % 100:02d}"
         timestamp = str(row["price_created_at"])
+        product_name = str(row["product_name"])
+        weight_grams = row.get("weight_grams")
+        if weight_grams is not None and product_name.endswith(" g"):
+            formatted_weight = format_weight_grams(weight_grams)[:-2]
+            name_prefix, separator, _ = product_name[:-2].rpartition(" ")
+            if separator:
+                product_name = f"{name_prefix} {formatted_weight} g"
         try:
-            registered_at = datetime.fromisoformat(
-                timestamp.replace("Z", "+00:00")
-            ).strftime("%d/%m/%Y")
+            registered_datetime = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if registered_datetime.tzinfo is None:
+                registered_datetime = registered_datetime.replace(tzinfo=timezone.utc)
+            registered_at = registered_datetime.astimezone(
+                timezone(timedelta(hours=-3))
+            ).strftime("%d/%m/%Y %H:%M")
         except ValueError as error:
             raise SupabaseApiError(
                 502,
@@ -1351,7 +1385,7 @@ class PricesState(rx.State):
                 "O Supabase retornou uma data de preço inválida.",
             ) from error
         return {
-            "product": str(row["product_name"]),
+            "product": product_name,
             "barcode": str(row["barcode"]),
             "brand": str(row["brand"]),
             "price": f"R$ {amount}",
@@ -1366,8 +1400,16 @@ class PricesState(rx.State):
         }
 
     async def save_price(self) -> Any:
+        if self.saving_price:
+            return
         if not self.has_selected_product:
             self.feedback = "Pesquise um produto pelo código de barras primeiro."
+            self.feedback_is_error = True
+            return
+        if self.barcode_input.strip() != self.selected_product.get("barcode"):
+            self.selected_product = {}
+            self.has_selected_product = False
+            self.feedback = "Pesquise novamente o código de barras antes de vincular o preço."
             self.feedback_is_error = True
             return
 
@@ -1382,23 +1424,28 @@ class PricesState(rx.State):
             return redirect
         if not token:
             return rx.redirect("/login")
+        self.saving_price = True
         try:
             await create_product_price(
                 token,
                 self.selected_product["id"],
                 price_cents,
             )
+            self.price_input = ""
             await self.load_prices()
-            if not self.feedback_is_error:
+            if self.feedback_is_error:
+                self.feedback = (
+                    "Preço vinculado, mas a lista não pôde ser atualizada. "
+                    f"{self.feedback}"
+                )
+            else:
                 self.feedback = "Preço vinculado com sucesso."
                 self.feedback_is_error = False
-                self.price_input = ""
         except SupabaseApiError as error:
             self.feedback = error.message
             self.feedback_is_error = True
-
-    def search_prices(self) -> None:
-        self.applied_price_search = self.price_search_input.strip().casefold()
+        finally:
+            self.saving_price = False
 
     @rx.var
     def filtered_prices(self) -> list[dict[str, str]]:
@@ -1449,6 +1496,15 @@ def prices_panel() -> rx.Component:
             "color": "#000000",
         },
     }
+    search_input_style = {
+        "width": "100%",
+        "height": "3.1rem",
+        "background": "#F7F9FC",
+        "color": "#000000",
+        "border": "1px solid #E5E7EB",
+        "border_radius": "0.7rem",
+        "_placeholder": {"color": "#5B6475", "opacity": "1"},
+    }
     primary_button_style = {
         "height": "3.1rem",
         "border_radius": "0.7rem",
@@ -1477,12 +1533,15 @@ def prices_panel() -> rx.Component:
                                 aria_label="Código de barras do produto",
                                 value=PricesState.barcode_input,
                                 on_change=PricesState.set_barcode_input,
+                                disabled=PricesState.saving_price,
+                                class_name="prices-input",
                                 **input_style,
                             ),
                             rx.button(
                                 rx.icon("search", size=19),
                                 aria_label="Pesquisar código de barras",
                                 on_click=PricesState.search_product,
+                                disabled=PricesState.saving_price,
                                 width="3.1rem",
                                 min_width="3.1rem",
                                 **primary_button_style,
@@ -1500,6 +1559,8 @@ def prices_panel() -> rx.Component:
                             aria_label="Preço do produto",
                             value=PricesState.price_input,
                             on_change=PricesState.set_price_input,
+                            disabled=PricesState.saving_price,
+                            class_name="prices-input",
                             **input_style,
                         ),
                     ),
@@ -1513,6 +1574,7 @@ def prices_panel() -> rx.Component:
                     "Vincular Preço",
                     type="button",
                     on_click=PricesState.save_price,
+                    disabled=PricesState.saving_price,
                     width="100%",
                     **primary_button_style,
                 ),
@@ -1588,25 +1650,13 @@ def prices_panel() -> rx.Component:
         rx.box(
             rx.vstack(
                 rx.heading("Consultar Preços", size="5", color="#172033"),
-                rx.hstack(
-                    rx.input(
-                        placeholder="Digite o código de barras, nome do produto ou marca",
-                        aria_label="Consultar preços por código, nome ou marca",
-                        value=PricesState.price_search_input,
-                        on_change=PricesState.set_price_search_input,
-                        **input_style,
-                    ),
-                    rx.button(
-                        rx.hstack(rx.text("Consultar"), rx.icon("search", size=18), gap="0.5rem"),
-                        type="button",
-                        on_click=PricesState.search_prices,
-                        **primary_button_style,
-                        padding="0 1.2rem",
-                    ),
-                    width="100%",
-                    gap="0.75rem",
-                    align="center",
-                    class_name="prices-search-row",
+                rx.input(
+                    placeholder="Digite o código de barras, nome do produto ou marca",
+                    aria_label="Consultar preços por código, nome ou marca",
+                    value=PricesState.price_search_input,
+                    on_change=PricesState.set_price_search_input,
+                    class_name="prices-search-input",
+                    **search_input_style,
                 ),
                 rx.heading("Preços cadastrados", size="4", color="#172033", margin_top="0.5rem"),
                 rx.box(
@@ -2560,7 +2610,7 @@ def inventory_panel() -> rx.Component:
                 background="transparent",
                 color="#000000",
                 font_size="0.95rem",
-                _placeholder={"color": "#000000", "opacity": "1"},
+                _placeholder={"color": "#5B6475", "opacity": "1"},
                 _focus={
                     "border": "none",
                     "outline": "none",
@@ -2568,21 +2618,22 @@ def inventory_panel() -> rx.Component:
                 },
             ),
             width="100%",
-            height="3.25rem",
+            height="3.1rem",
             padding="0 1rem",
             gap="0.7rem",
             display="flex",
             flex_direction="row",
             align_items="center",
-            background="white",
+            background="#F7F9FC",
             border="1px solid #E5E7EB",
-            border_radius="0.75rem",
-            box_shadow="0 5px 18px rgba(23, 32, 51, 0.05)",
+            border_radius="0.7rem",
+            box_shadow="none",
             transition="border-color 160ms ease, box-shadow 160ms ease",
             _focus_within={
                 "border_color": "#93C5FD",
-                "box_shadow": "0 0 0 3px rgba(147, 197, 253, 0.28)",
+                "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2)",
             },
+            class_name="inventory-search-shell",
         ),
         rx.box(
             rx.foreach(AuthState.filtered_inventory, inventory_card),
@@ -2611,7 +2662,21 @@ def dashboard_layout(
     active_destination: str = "home",
     subtitle: str = "Aqui está um resumo do seu mercado hoje.",
     fixed_sidebar: bool = False,
+    scroll_content: bool = False,
 ) -> rx.Component:
+    content_area = (
+        rx.box(
+            content,
+            width="100%",
+            flex="1",
+            min_height="0",
+            overflow_y="auto",
+            overflow_x="hidden",
+            class_name="prices-content-scroll" if scroll_content else None,
+        )
+        if scroll_content
+        else content
+    )
     return rx.hstack(
         sidebar(
             active_destination=active_destination,
@@ -2620,13 +2685,16 @@ def dashboard_layout(
         rx.box(
             rx.vstack(
                 dashboard_header(subtitle=subtitle),
-                content,
+                content_area,
                 width="100%",
                 max_width="70rem",
                 margin="0 auto",
                 padding="clamp(2rem, 6vh, 4.5rem) clamp(1.25rem, 5vw, 5rem) 6rem",
                 gap="clamp(3rem, 8vh, 5.5rem)",
                 align="stretch",
+                height="100%" if scroll_content else None,
+                min_height="0" if scroll_content else None,
+                box_sizing="border-box" if scroll_content else None,
             ),
             rx.image(
                 src="/logo_bipsystem.png",
@@ -2640,10 +2708,13 @@ def dashboard_layout(
             position="relative",
             flex="1",
             min_width="0",
+            height="100dvh" if scroll_content else "auto",
             min_height="100dvh",
-            overflow="auto",
+            overflow="hidden" if scroll_content else "auto",
             background="#F7F9FC",
             margin_left="16rem" if fixed_sidebar else "0",
+            class_name="prices-dashboard-main" if scroll_content else None,
+            box_sizing="border-box" if scroll_content else None,
         ),
         width="100%",
         min_height="100dvh",
@@ -2715,6 +2786,8 @@ def precos_page() -> rx.Component:
         prices_panel(),
         active_destination="prices",
         subtitle="Aqui você pode cadastrar e consultar preços dos produtos",
+        fixed_sidebar=True,
+        scroll_content=True,
     )
 
 
@@ -2775,6 +2848,57 @@ app = rx.App(
         ".registration-list-panel .registration-search-input input::placeholder": {
             "color": "#5B6475 !important",
             "opacity": "1 !important",
+        },
+        ".prices-dashboard-main .prices-input, .prices-dashboard-main .prices-input:hover, .prices-dashboard-main .prices-input:focus-within, .prices-dashboard-main .prices-input:active": {
+            "background": "#D9D9D9 !important",
+            "color": "#000000 !important",
+        },
+        ".prices-dashboard-main .prices-input input, .prices-dashboard-main .prices-input input:hover, .prices-dashboard-main .prices-input input:focus, .prices-dashboard-main .prices-input input:focus-visible, .prices-dashboard-main .prices-input input:active": {
+            "background": "#D9D9D9 !important",
+            "color": "#000000 !important",
+        },
+        ".prices-dashboard-main .prices-input input::placeholder": {
+            "color": "#000000 !important",
+            "opacity": "1 !important",
+        },
+        ".prices-dashboard-main .prices-search-input, .prices-dashboard-main .prices-search-input:hover, .prices-dashboard-main .prices-search-input:focus-within": {
+            "background": "#F7F9FC !important",
+            "border": "1px solid #E5E7EB !important",
+        },
+        ".prices-dashboard-main .prices-search-input:focus-within": {
+            "border": "1px solid #E5E7EB !important",
+            "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2) !important",
+        },
+        ".prices-dashboard-main .prices-search-input input, .prices-dashboard-main .prices-search-input input:focus": {
+            "background": "#F7F9FC !important",
+            "color": "#000000 !important",
+        },
+        ".prices-dashboard-main .prices-search-input::placeholder, .prices-dashboard-main .prices-search-input input::placeholder": {
+            "color": "#5B6475 !important",
+            "opacity": "1 !important",
+        },
+        ".inventory-search-shell, .inventory-search-shell:hover, .inventory-search-shell:focus-within": {
+            "background": "#F7F9FC !important",
+            "border": "1px solid #E5E7EB !important",
+        },
+        ".inventory-search-shell:focus-within": {
+            "border": "1px solid #E5E7EB !important",
+            "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2) !important",
+        },
+        ".inventory-search-shell input, .inventory-search-shell input:focus": {
+            "background": "transparent !important",
+            "color": "#000000 !important",
+        },
+        ".inventory-search-shell input::placeholder": {
+            "color": "#5B6475 !important",
+            "opacity": "1 !important",
+        },
+        ".prices-content-scroll, .prices-table-scroll": {
+            "scrollbar_width": "none",
+            "-ms-overflow-style": "none",
+        },
+        ".prices-content-scroll::-webkit-scrollbar, .prices-table-scroll::-webkit-scrollbar": {
+            "display": "none",
         },
         ".registration-employee-scroll": {
             "scrollbar_width": "none",
@@ -2847,19 +2971,13 @@ app = rx.App(
             },
         },
         "@media (max-width: 639px)": {
-            ".prices-search-row": {
-                "flex_direction": "column",
-                "align_items": "stretch",
-            },
-            ".prices-search-row button": {
-                "width": "100%",
-            },
-        },
-        "@media (max-width: 639px)": {
             ".dashboard-sidebar": {
                 "width": "5.5rem",
                 "min_width": "5.5rem",
                 "padding": "1rem 0.35rem",
+            },
+            ".prices-dashboard-main": {
+                "margin_left": "5.5rem !important",
             },
             ".dashboard-sidebar img": {
                 "width": "4.5rem",

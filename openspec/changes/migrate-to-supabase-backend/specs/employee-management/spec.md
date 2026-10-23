@@ -20,19 +20,15 @@ The system SHALL allow owners and managers to list active and inactive employee 
 - **THEN** the request is denied and no profile list is disclosed
 
 ### Requirement: Employee accounts use Supabase Auth and constrained role assignment
-The system SHALL create employee credentials through Supabase Auth and store non-secret profile attributes separately. Owners MAY assign `owner`, `manager`, or `operator`; managers MAY create or manage only `operator` accounts. The system SHALL enforce a unique normalized email and SHALL never store a plaintext password in an application table.
+The system SHALL create employee credentials through Supabase Auth and store non-secret profile attributes separately. Owners and managers SHALL have identical permissions and MAY assign `owner`, `manager`, or `operator`. The system SHALL enforce a unique normalized email and SHALL never store a plaintext password in an application table.
 
 #### Scenario: Owner creates an employee
 - **WHEN** an owner submits valid name, email, password, and supported role
 - **THEN** the system creates an Auth account and associated profile with only public profile fields returned
 
-#### Scenario: Manager creates an operator
-- **WHEN** a manager submits valid data for an operator account
-- **THEN** the system creates the Auth account and operator profile
-
-#### Scenario: Manager attempts to grant an elevated role
-- **WHEN** a manager attempts to create or promote an account to manager or owner
-- **THEN** the operation is rejected and neither the account nor the role change is applied
+#### Scenario: Manager creates an employee with any supported role
+- **WHEN** a manager submits valid data for an employee with any supported role
+- **THEN** the system creates the Auth account and profile with the requested role
 
 #### Scenario: Duplicate normalized email is submitted
 - **WHEN** an authorized user submits an email that is already registered, regardless of case or surrounding whitespace
@@ -43,18 +39,14 @@ The system SHALL create employee credentials through Supabase Auth and store non
 - **THEN** the system rejects the operation and does not create an account
 
 ### Requirement: Employee edits preserve optional password semantics
-The system SHALL allow an owner to edit any employee and a manager to edit only operator accounts. Name and email updates SHALL affect the profile and Auth identity consistently. An empty optional password field SHALL leave the existing password unchanged; a submitted password SHALL satisfy the account password policy.
+The system SHALL allow owners and managers to edit any employee. Name and email updates SHALL affect the profile and Auth identity consistently. An empty optional password field SHALL leave the existing password unchanged; a submitted password SHALL satisfy the account password policy.
 
 #### Scenario: Authorized user edits profile without changing password
 - **WHEN** an authorized user changes employee details and leaves the optional password blank
 - **THEN** the profile and email are updated while the current password remains unchanged
 
-#### Scenario: Manager edits an elevated account
-- **WHEN** a manager attempts to edit a manager or owner account
-- **THEN** the operation is rejected and the account remains unchanged
-
 ### Requirement: Employee deletion follows the existing confirmation and ownership safeguards
-The system SHALL preserve explicit user confirmation before deletion, prevent duplicate concurrent delete submissions, and remove a profile only after the Auth account deletion succeeds. A manager MAY delete only operator accounts; an owner MAY delete any other employee but SHALL NOT delete their own account through this screen.
+The system SHALL preserve explicit user confirmation before deletion, prevent duplicate concurrent delete submissions, and remove a profile only after the Auth account deletion succeeds. Owners and managers MAY delete any other employee but SHALL NOT delete their own account through this screen.
 
 #### Scenario: User cancels deletion
 - **WHEN** the user dismisses the employee deletion confirmation

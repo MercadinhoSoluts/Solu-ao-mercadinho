@@ -2,22 +2,25 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from bipsystem.auth_client import XanoApiError
+from bipsystem.auth_client import SupabaseApiError
 from bipsystem.bipsystem import AuthState
 
 
 def deletion_state(**overrides: object) -> SimpleNamespace:
+    employee_one = "2d8973c0-2c38-4db5-95c8-a3cf8df4621f"
+    employee_two = "d1e35c87-9f35-4b23-9e36-a6b2f7f45ef0"
+    employee_three = "dfcc9c1a-1ff0-4351-ae6b-b28aeedc246b"
     values: dict[str, object] = {
         "employee_delete_busy": False,
         "employee_delete_open": True,
-        "employee_delete_id": 2,
+        "employee_delete_id": employee_two,
         "employee_delete_name": "Ana",
         "user_role": "owner",
         "_auth_token": "token",
         "employees": [
-            {"id": 1, "name": "Bruno"},
-            {"id": 2, "name": "Ana"},
-            {"id": 3, "name": "Caio"},
+            {"id": employee_one, "name": "Bruno"},
+            {"id": employee_two, "name": "Ana"},
+            {"id": employee_three, "name": "Caio"},
         ],
         "registration_feedback": "",
     }
@@ -38,8 +41,17 @@ class EmployeeDeleteStateTests(unittest.IsolatedAsyncioTestCase):
         ) as delete_mock:
             await AuthState.confirm_employee_delete.fn(state)
 
-        delete_mock.assert_awaited_once_with("token", 2)
-        self.assertEqual([employee["id"] for employee in state.employees], [1, 3])
+        delete_mock.assert_awaited_once_with(
+            "token",
+            "d1e35c87-9f35-4b23-9e36-a6b2f7f45ef0",
+        )
+        self.assertEqual(
+            [employee["id"] for employee in state.employees],
+            [
+                "2d8973c0-2c38-4db5-95c8-a3cf8df4621f",
+                "dfcc9c1a-1ff0-4351-ae6b-b28aeedc246b",
+            ],
+        )
         self.assertEqual(
             state.registration_feedback,
             "Funcionário excluído com sucesso.",
@@ -48,16 +60,34 @@ class EmployeeDeleteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state.employee_delete_busy)
 
     async def test_failed_delete_keeps_employee_and_reports_error(self) -> None:
-        state = deletion_state(employees=[{"id": 2, "name": "Ana"}])
+        state = deletion_state(
+            employees=[
+                {
+                    "id": "d1e35c87-9f35-4b23-9e36-a6b2f7f45ef0",
+                    "name": "Ana",
+                }
+            ]
+        )
 
         with patch(
             "bipsystem.bipsystem.delete_employee",
-            new=AsyncMock(side_effect=XanoApiError(500)),
+            new=AsyncMock(side_effect=SupabaseApiError(500)),
         ) as delete_mock:
             await AuthState.confirm_employee_delete.fn(state)
 
-        delete_mock.assert_awaited_once_with("token", 2)
-        self.assertEqual(state.employees, [{"id": 2, "name": "Ana"}])
+        delete_mock.assert_awaited_once_with(
+            "token",
+            "d1e35c87-9f35-4b23-9e36-a6b2f7f45ef0",
+        )
+        self.assertEqual(
+            state.employees,
+            [
+                {
+                    "id": "d1e35c87-9f35-4b23-9e36-a6b2f7f45ef0",
+                    "name": "Ana",
+                }
+            ],
+        )
         self.assertEqual(
             state.registration_feedback,
             "Não foi possível excluir o funcionário. Tente novamente.",
@@ -72,7 +102,7 @@ class EmployeeDeleteStateTests(unittest.IsolatedAsyncioTestCase):
             AuthState.close_employee_delete.fn(state)
 
         delete_mock.assert_not_awaited()
-        self.assertEqual(state.employee_delete_id, 0)
+        self.assertEqual(state.employee_delete_id, "")
         self.assertEqual(state.employee_delete_name, "")
         self.assertFalse(state.employee_delete_open)
 
@@ -83,4 +113,11 @@ class EmployeeDeleteStateTests(unittest.IsolatedAsyncioTestCase):
             await AuthState.confirm_employee_delete.fn(state)
 
         delete_mock.assert_not_awaited()
-        self.assertEqual([employee["id"] for employee in state.employees], [1, 2, 3])
+        self.assertEqual(
+            [employee["id"] for employee in state.employees],
+            [
+                "2d8973c0-2c38-4db5-95c8-a3cf8df4621f",
+                "d1e35c87-9f35-4b23-9e36-a6b2f7f45ef0",
+                "dfcc9c1a-1ff0-4351-ae6b-b28aeedc246b",
+            ],
+        )

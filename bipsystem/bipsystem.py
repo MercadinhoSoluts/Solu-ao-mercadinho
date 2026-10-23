@@ -1,48 +1,102 @@
-import asyncio
-from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
+from uuid import uuid4
 
 import reflex as rx
 
 from bipsystem.auth_client import (
-    XanoApiError,
+    AuthSession,
+    SupabaseApiError,
+    add_cashier_purchase_item,
+    cancel_cashier_purchase,
+    complete_cashier_purchase,
     create_inventory_lot,
     create_product,
     create_employee,
+    create_product_price,
     delete_employee,
+    find_product_by_barcode,
+    get_available_stock,
     get_current_user,
+    get_cashier_purchase,
     list_employees,
     list_inventory,
+    list_current_prices,
     list_products,
     is_valid_product_text,
     login,
+    logout,
     normalize_role,
+    open_cashier_purchase,
     parse_inventory_date,
     parse_inventory_units,
     parse_product_weight,
-    update_inventory_lot,
+    refresh_session,
+    validate_price_cents,
     validate_password,
     update_employee,
 )
 
-INVENTORY_OPERATION_LOCK = asyncio.Lock()
+
+def format_weight_grams(value: Any) -> str:
+    weight = format(Decimal(str(value)), "f")
+    if "." in weight:
+        weight = weight.rstrip("0").rstrip(".")
+    return f"{weight} g"
 
 
-def find_inventory_record(
-    inventory: list[dict[str, Any]],
-    product_id: int,
-    validity: str,
-) -> dict[str, Any] | None:
-    return next(
-        (
-            record
-            for record in inventory
-            if record.get("produtos_id") == product_id
-            and str(record.get("validade") or "") == validity
-        ),
-        None,
+def format_currency_cents(value: int) -> str:
+    return f"{value // 100},{value % 100:02d} R$"
+
+
+def cashier_business_date() -> str:
+    return datetime.now(timezone(timedelta(hours=-3))).date().isoformat()
+
+
+async def cashier_stock_error(
+    token: str,
+    barcode: str,
+    requested_total: int,
+    business_date: str,
+    already_added: int = 0,
+) -> str | None:
+    product = await find_product_by_barcode(token, barcode)
+    if product is None:
+        return None
+
+    available = await get_available_stock(token, product["id"], business_date)
+    if requested_total <= available:
+        return None
+    if already_added:
+        return (
+            f"Estoque insuficiente. Disponível: {available} unidades. "
+            f"Já na compra: {already_added}. "
+            f"Quantidade solicitada total: {requested_total}."
+        )
+    return (
+        f"Estoque insuficiente. Disponível: {available} unidades. "
+        f"Quantidade solicitada: {requested_total}."
     )
+
+
+def filter_prices(
+    prices: list[dict[str, str]],
+    query: str,
+) -> list[dict[str, str]]:
+    normalized_query = query.strip().casefold()
+    if not normalized_query:
+        return prices
+    return [
+        price
+        for price in prices
+        if normalized_query in price["search"]
+    ]
 
 
 class AuthState(rx.State):
@@ -51,10 +105,29 @@ class AuthState(rx.State):
     user_role: str = ""
     login_feedback: str = ""
     registration_feedback: str = ""
+    cashier_navigation_started: bool = False
+    cashier_purchase_id: str = ""
+    cashier_open_request_id: str = ""
+    cashier_purchase_status: str = ""
+    cashier_payment_method: str = ""
+    cashier_items: list[dict[str, str]] = []
+    cashier_total_display: str = "0,00 R$"
+    cashier_barcode: str = ""
+    cashier_quantity: str = "1"
+    cashier_entry_open: bool = True
+    cashier_feedback: str = ""
+    cashier_busy: bool = False
+    cashier_cancel_confirmation_open: bool = False
+    cashier_payment_modal_open: bool = False
+    cashier_selected_payment_method: str = ""
+    cashier_payment_feedback: str = ""
+    cashier_pending_request_id: str = ""
+    cashier_pending_barcode: str = ""
+    cashier_pending_quantity: int = 0
     employees: list[dict[str, Any]] = []
     employee_search: str = ""
-    employee_editing_id: int = 0
-    employee_delete_id: int = 0
+    employee_editing_id: str = ""
+    employee_delete_id: str = ""
     employee_delete_name: str = ""
     employee_delete_open: bool = False
     employee_delete_busy: bool = False
@@ -74,31 +147,39 @@ class AuthState(rx.State):
     inventory_search: str = ""
     is_busy: bool = False
     _auth_token: str = ""
+    _refresh_token: str = ""
     _token_expires_at: float = 0.0
 
     @staticmethod
     def _error_message(
-        error: XanoApiError,
+        error: SupabaseApiError,
         action: str,
         authentication: bool = False,
     ) -> str:
         if error.status_code in (401, 403):
             if authentication:
-                return "Senha incorreta. Verifique sua senha e tente novamente."
+                if error.code in {"profile_missing", "invalid_profile"}:
+                    return "Sua conta não possui um perfil válido. Contate um administrador."
+                return "E-mail ou senha inválidos. Verifique os dados e tente novamente."
             return "Você não tem autorização para realizar esta ação."
+        if authentication and error.status_code == 400:
+            return "E-mail ou senha inválidos. Verifique os dados e tente novamente."
         if error.status_code == 409:
             return "Este e-mail já está cadastrado."
         if 400 <= error.status_code < 500:
             return "Verifique os dados informados e tente novamente."
         if error.status_code == 0:
-            return "Não foi possível conectar ao Xano."
+            return "Não foi possível conectar ao Supabase."
+        if error.code == "configuration_error":
+            return "O serviço de autenticação não está configurado corretamente."
         return f"Não foi possível {action}. Tente novamente."
 
     @staticmethod
     def get_post_login_redirect(user_role: str | None) -> str | None:
-        if user_role == "operator":
-            return "/caixa"
-        if user_role in {"owner", "manager"}:
+        normalized_role = normalize_role(str(user_role or "")) if user_role is not None else None
+        if normalized_role == "operator":
+            return "/caixa-inicio"
+        if normalized_role in {"owner", "manager"}:
             return "/"
         return None
 
@@ -107,12 +188,68 @@ class AuthState(rx.State):
         self.user_name = "(nome)"
         self.user_role = ""
         self._auth_token = ""
+        self._refresh_token = ""
         self._token_expires_at = 0.0
+        self._clear_cashier_purchase()
+
+    def _clear_cashier_purchase(self) -> None:
+        self.cashier_purchase_id = ""
+        self.cashier_open_request_id = ""
+        self.cashier_purchase_status = ""
+        self.cashier_payment_method = ""
+        self.cashier_items = []
+        self.cashier_total_display = "0,00 R$"
+        self.cashier_barcode = ""
+        self.cashier_quantity = "1"
+        self.cashier_entry_open = True
+        self.cashier_feedback = ""
+        self.cashier_busy = False
+        self.cashier_navigation_started = False
+        self.cashier_cancel_confirmation_open = False
+        self.cashier_payment_modal_open = False
+        self.cashier_selected_payment_method = ""
+        self.cashier_payment_feedback = ""
+        self.cashier_pending_request_id = ""
+        self.cashier_pending_barcode = ""
+        self.cashier_pending_quantity = 0
 
     def _set_user(self, user: Any) -> None:
         self.authenticated = True
         self.user_name = user.name
-        self.user_role = user.role
+        self.user_role = normalize_role(str(user.role)) or user.role
+
+    def _set_session(self, session: AuthSession) -> None:
+        self._auth_token = session.access_token
+        self._refresh_token = session.refresh_token
+        self._token_expires_at = float(session.expires_at)
+
+    def _set_cashier_purchase(self, purchase: dict[str, Any]) -> None:
+        if self.cashier_purchase_id and self.cashier_purchase_id != purchase["id"]:
+            self.cashier_pending_request_id = ""
+            self.cashier_pending_barcode = ""
+            self.cashier_pending_quantity = 0
+        self.cashier_purchase_id = purchase["id"]
+        self.cashier_purchase_status = purchase["status"]
+        self.cashier_payment_method = purchase.get("payment_method") or ""
+        self.cashier_items = [
+            {
+                "product_name": item["product_name"],
+                "quantity": str(item["quantity"]),
+                "barcode": item["barcode"],
+                "unit_price": format_currency_cents(item["unit_price_cents"]),
+                "line_total": format_currency_cents(item["line_total_cents"]),
+            }
+            for item in purchase["items"]
+        ]
+        self.cashier_total_display = format_currency_cents(purchase["total_cents"])
+        self.cashier_entry_open = purchase["status"] == "open"
+
+    def _handle_cashier_error(self, error: SupabaseApiError, action: str) -> None:
+        if error.status_code == 401:
+            self._clear_session()
+        elif error.status_code == 403 or error.code == "P1004":
+            self._clear_cashier_purchase()
+        self.cashier_feedback = error.message or self._error_message(error, action)
 
     async def submit(self, form_data: dict[str, Any]) -> Any:
         email = str(form_data.get("user", "")).strip()
@@ -125,19 +262,22 @@ class AuthState(rx.State):
 
         self.is_busy = True
         try:
-            token, _ = await login(email, password)
-            user = await get_current_user(token)
-            if user.is_active is False:
+            session = await login(email, password)
+            user = await get_current_user(session.access_token)
+            if not user.is_active:
+                await logout(session.access_token)
                 self.login_feedback = "Este usuário está inativo."
                 return
-            self._auth_token = token
-            self._token_expires_at = datetime.now(timezone.utc).timestamp() + 86400
+            self._set_session(session)
             self._set_user(user)
             redirect = self.get_post_login_redirect(self.user_role)
             if redirect is not None:
                 return rx.redirect(redirect)
+            await logout(session.access_token)
+            self._clear_session()
+            self.login_feedback = "Sua conta não possui um cargo válido."
             return None
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             self._clear_session()
             self.login_feedback = self._error_message(
                 error,
@@ -148,26 +288,342 @@ class AuthState(rx.State):
             self.is_busy = False
 
     async def require_auth(self) -> Any:
-        if not self._auth_token or self._token_expires_at <= datetime.now(timezone.utc).timestamp():
+        if not self._auth_token or not self._refresh_token:
             self._clear_session()
             return rx.redirect("/login")
 
         try:
+            if self._token_expires_at <= datetime.now(timezone.utc).timestamp() + 60:
+                session = await refresh_session(self._refresh_token)
+                self._set_session(session)
             user = await get_current_user(self._auth_token)
-            if user.is_active is False:
+            if not user.is_active:
                 self._clear_session()
                 return rx.redirect("/login")
             self._set_user(user)
-        except XanoApiError:
+        except SupabaseApiError as error:
             self._clear_session()
+            if error.status_code == 0:
+                self.login_feedback = "Não foi possível conectar ao Supabase."
+            elif error.code == "configuration_error":
+                self.login_feedback = "O serviço de autenticação não está configurado corretamente."
+            elif error.code in {"profile_missing", "invalid_profile"}:
+                self.login_feedback = "Sua conta não possui um perfil válido. Contate um administrador."
+            elif error.status_code >= 500:
+                self.login_feedback = "Não foi possível validar sua sessão. Tente novamente."
+            else:
+                self.login_feedback = "Sua sessão expirou. Entre novamente."
             return rx.redirect("/login")
 
     async def require_admin(self) -> Any:
         result = await self.require_auth()
         if result is not None:
             return result
-        if self.user_role not in {"owner", "manager"}:
+        if self.user_role not in {"owner", "manager", "proprietario", "admin"}:
             return rx.redirect("/")
+
+    async def require_operational_access(self) -> Any:
+        result = await self.require_auth()
+        if result is not None:
+            return result
+        if self.user_role not in {"owner", "manager", "operator"}:
+            return rx.redirect("/login")
+
+    async def require_cashier_welcome(self) -> Any:
+        result = await self.require_auth()
+        if result is not None:
+            return result
+        if self.user_role != "operator":
+            return rx.redirect(self.get_post_login_redirect(self.user_role) or "/login")
+        self.cashier_navigation_started = False
+
+    async def start_cashier_sale(self) -> Any:
+        if self.cashier_navigation_started:
+            return
+        self.cashier_navigation_started = True
+        result = await self.require_auth()
+        if result is not None:
+            self.cashier_navigation_started = False
+            return result
+        if self.user_role != "operator":
+            self.cashier_navigation_started = False
+            return rx.redirect(self.get_post_login_redirect(self.user_role) or "/login")
+        if not self._auth_token:
+            self.cashier_navigation_started = False
+            self.cashier_feedback = "Sua sessão expirou. Entre novamente."
+            return rx.redirect("/login")
+        if not self.cashier_open_request_id:
+            self.cashier_open_request_id = str(uuid4())
+        try:
+            purchase = await open_cashier_purchase(
+                self._auth_token,
+                self.cashier_open_request_id,
+            )
+            self._set_cashier_purchase(purchase)
+            self.cashier_feedback = ""
+            return rx.redirect("/caixa")
+        except SupabaseApiError as error:
+            self.cashier_navigation_started = False
+            self._handle_cashier_error(error, "iniciar a compra")
+
+    async def require_cashier_page(self) -> Any:
+        result = await self.require_auth()
+        if result is not None:
+            return result
+        if self.user_role != "operator":
+            return rx.redirect(self.get_post_login_redirect(self.user_role) or "/login")
+        if not self._auth_token:
+            self.cashier_feedback = "Sua sessão expirou. Entre novamente."
+            return rx.redirect("/login")
+
+        try:
+            if self.cashier_purchase_id:
+                purchase = await get_cashier_purchase(
+                    self._auth_token,
+                    self.cashier_purchase_id,
+                )
+            else:
+                if not self.cashier_open_request_id:
+                    self.cashier_open_request_id = str(uuid4())
+                purchase = await open_cashier_purchase(
+                    self._auth_token,
+                    self.cashier_open_request_id,
+                )
+            self._set_cashier_purchase(purchase)
+            self.cashier_feedback = ""
+        except SupabaseApiError as error:
+            self._handle_cashier_error(error, "recuperar a compra")
+
+    async def add_cashier_item(self, form_data: dict[str, Any]) -> None:
+        if self.cashier_busy:
+            return
+        barcode = str(form_data.get("barcode", self.cashier_barcode)).strip()
+        quantity_text = str(form_data.get("quantity", self.cashier_quantity)).strip()
+        self.cashier_barcode = barcode
+        self.cashier_quantity = quantity_text
+        if not barcode:
+            self.cashier_feedback = "Informe o código de barras do produto."
+            return
+        if not quantity_text.isdecimal() or int(quantity_text) <= 0:
+            self.cashier_feedback = "A quantidade deve ser um inteiro maior que zero."
+            return
+        if not self.cashier_purchase_id or self.cashier_purchase_status != "open":
+            self.cashier_feedback = "Não há uma compra aberta para receber itens."
+            return
+        if not self._auth_token:
+            self.cashier_feedback = "Sua sessão expirou. Entre novamente."
+            return
+
+        quantity = int(quantity_text)
+        self.cashier_busy = True
+        try:
+            already_added = sum(
+                int(item["quantity"])
+                for item in self.cashier_items
+                if item["barcode"] == barcode
+            )
+            stock_error = await cashier_stock_error(
+                self._auth_token,
+                barcode,
+                already_added + quantity,
+                cashier_business_date(),
+                already_added,
+            )
+            if stock_error:
+                self.cashier_feedback = stock_error
+                return
+
+            if (
+                self.cashier_pending_request_id
+                and self.cashier_pending_barcode == barcode
+                and self.cashier_pending_quantity == quantity
+            ):
+                request_id = self.cashier_pending_request_id
+            else:
+                request_id = str(uuid4())
+                self.cashier_pending_request_id = request_id
+                self.cashier_pending_barcode = barcode
+                self.cashier_pending_quantity = quantity
+
+            purchase = await add_cashier_purchase_item(
+                self._auth_token,
+                self.cashier_purchase_id,
+                barcode,
+                quantity,
+                request_id,
+            )
+            self._set_cashier_purchase(purchase)
+            self.cashier_barcode = ""
+            self.cashier_quantity = "1"
+            self.cashier_feedback = "Item incluído na compra."
+            self.cashier_pending_request_id = ""
+            self.cashier_pending_barcode = ""
+            self.cashier_pending_quantity = 0
+        except SupabaseApiError as error:
+            self._handle_cashier_error(error, "incluir o produto")
+        finally:
+            self.cashier_busy = False
+
+    def set_cashier_barcode(self, value: str) -> None:
+        self.cashier_barcode = value
+
+    def set_cashier_quantity(self, value: str) -> None:
+        self.cashier_quantity = value
+
+    def toggle_cashier_entry(self) -> None:
+        if self.cashier_purchase_status != "open":
+            return
+        self.cashier_entry_open = not self.cashier_entry_open
+        self.cashier_feedback = ""
+
+    def open_cashier_payment_modal(self) -> None:
+        if (
+            self.cashier_busy
+            or self.cashier_purchase_status != "open"
+            or not self.cashier_items
+            or not self._auth_token
+        ):
+            return
+        self.cashier_selected_payment_method = ""
+        self.cashier_payment_feedback = ""
+        self.cashier_payment_modal_open = True
+
+    def close_cashier_payment_modal(self) -> None:
+        if self.cashier_busy:
+            return
+        self.cashier_payment_modal_open = False
+        self.cashier_selected_payment_method = ""
+        self.cashier_payment_feedback = ""
+
+    def set_cashier_payment_modal_open(self, is_open: bool) -> None:
+        if is_open:
+            self.open_cashier_payment_modal()
+        else:
+            self.close_cashier_payment_modal()
+
+    async def select_cashier_payment_method(self, method: str) -> None:
+        if (
+            not self.cashier_payment_modal_open
+            or self.cashier_purchase_status != "open"
+            or self.cashier_busy
+            or not self._auth_token
+            or not isinstance(method, str)
+            or method not in {"credit_card", "debit_card", "pix", "cash"}
+        ):
+            return
+        self.cashier_selected_payment_method = method
+        self.cashier_payment_feedback = ""
+        self.cashier_busy = True
+        payment_labels = {
+            "credit_card": "cartão de crédito",
+            "debit_card": "cartão de débito",
+            "pix": "Pix",
+            "cash": "dinheiro",
+        }
+        try:
+            requested_by_barcode: dict[str, int] = {}
+            for item in self.cashier_items:
+                barcode = item["barcode"]
+                requested_by_barcode[barcode] = (
+                    requested_by_barcode.get(barcode, 0)
+                    + int(item["quantity"])
+                )
+            business_date = cashier_business_date()
+            for barcode, requested_total in requested_by_barcode.items():
+                stock_error = await cashier_stock_error(
+                    self._auth_token,
+                    barcode,
+                    requested_total,
+                    business_date,
+                )
+                if stock_error:
+                    self.cashier_payment_feedback = stock_error
+                    return
+
+            purchase = await complete_cashier_purchase(
+                self._auth_token,
+                self.cashier_purchase_id,
+                method,
+            )
+            if (
+                purchase["status"] != "completed"
+                or purchase["payment_method"] != method
+            ):
+                raise SupabaseApiError(
+                    502,
+                    "invalid_response",
+                    "O Supabase não confirmou os dados da venda finalizada.",
+                )
+            self._set_cashier_purchase(purchase)
+            self.cashier_open_request_id = ""
+            self.cashier_payment_modal_open = False
+            self.cashier_selected_payment_method = ""
+            self.cashier_payment_feedback = ""
+            self.cashier_feedback = (
+                f"Venda concluída. Método informado: {payment_labels[method]}."
+            )
+        except SupabaseApiError as error:
+            self._handle_cashier_error(error, "finalizar a venda")
+            self.cashier_payment_feedback = self.cashier_feedback
+        finally:
+            self.cashier_busy = False
+
+    def open_cashier_cancel_confirmation(self) -> None:
+        if self.cashier_purchase_status == "open":
+            self.cashier_cancel_confirmation_open = True
+
+    def dismiss_cashier_cancel_confirmation(self) -> None:
+        self.cashier_cancel_confirmation_open = False
+
+    async def cancel_cashier_sale(self) -> None:
+        if (
+            self.cashier_busy
+            or self.cashier_purchase_status != "open"
+            or not self._auth_token
+        ):
+            self.cashier_cancel_confirmation_open = False
+            return
+        self.cashier_busy = True
+        try:
+            purchase = await cancel_cashier_purchase(
+                self._auth_token,
+                self.cashier_purchase_id,
+            )
+            self._set_cashier_purchase(purchase)
+            self.cashier_open_request_id = ""
+            self.cashier_feedback = "Compra cancelada. O histórico foi preservado."
+        except SupabaseApiError as error:
+            self._handle_cashier_error(error, "cancelar a compra")
+        finally:
+            self.cashier_busy = False
+            self.cashier_cancel_confirmation_open = False
+
+    async def start_new_cashier_sale(self) -> None:
+        if (
+            self.cashier_busy
+            or self.cashier_purchase_status == "open"
+            or not self._auth_token
+        ):
+            return
+        self.cashier_open_request_id = str(uuid4())
+        self.cashier_feedback = ""
+        self.cashier_busy = True
+        try:
+            purchase = await open_cashier_purchase(
+                self._auth_token,
+                self.cashier_open_request_id,
+            )
+            self._set_cashier_purchase(purchase)
+        except SupabaseApiError as error:
+            self._handle_cashier_error(error, "iniciar uma nova compra")
+        finally:
+            self.cashier_busy = False
+
+    async def require_operational_access_and_load_inventory(self) -> Any:
+        result = await self.require_operational_access()
+        if result is not None:
+            return result
+        return await self.load_inventory()
 
     async def require_admin_and_load_employees(self) -> Any:
         self.registration_feedback = ""
@@ -176,15 +632,26 @@ class AuthState(rx.State):
             return result
         await self.load_employees()
 
-    def logout(self) -> Any:
+    async def logout(self) -> Any:
+        token = self._auth_token
+        logout_error = False
+        if token:
+            try:
+                await logout(token)
+            except SupabaseApiError:
+                logout_error = True
         self._clear_session()
-        self.login_feedback = ""
+        self.login_feedback = (
+            "Não foi possível confirmar o encerramento da sessão."
+            if logout_error
+            else ""
+        )
         self.registration_feedback = ""
         return rx.redirect("/login")
 
     async def register_employee(self, form_data: dict[str, Any]) -> None:
         self.registration_feedback = ""
-        if self.user_role not in {"owner", "manager"}:
+        if self.user_role not in {"owner", "manager", "proprietario", "admin"}:
             self.registration_feedback = "Você não tem autorização para cadastrar funcionários."
             return
 
@@ -210,7 +677,7 @@ class AuthState(rx.State):
         try:
             await create_employee(self._auth_token, name, email, password, role)
             self.registration_feedback = "Funcionário cadastrado com sucesso."
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
             self.registration_feedback = self._error_message(error, "cadastrar o funcionário")
@@ -239,7 +706,7 @@ class AuthState(rx.State):
             return
         try:
             self.employees = await list_employees(self._auth_token)
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
             self.registration_feedback = self._error_message(
@@ -275,7 +742,7 @@ class AuthState(rx.State):
         return not self.employee_search.strip()
 
     def start_employee_edit(self, employee: dict[str, Any]) -> None:
-        self.employee_editing_id = int(employee.get("id", 0))
+        self.employee_editing_id = str(employee.get("id", ""))
         self.employee_form_name = str(employee.get("name", ""))
         self.employee_form_email = str(employee.get("email", ""))
         self.employee_form_role = str(employee.get("role", ""))
@@ -283,7 +750,7 @@ class AuthState(rx.State):
         self.registration_feedback = ""
 
     def cancel_employee_edit(self) -> None:
-        self.employee_editing_id = 0
+        self.employee_editing_id = ""
         self.employee_form_name = ""
         self.employee_form_email = ""
         self.employee_form_role = ""
@@ -333,7 +800,7 @@ class AuthState(rx.State):
             await self.load_employees()
             self.cancel_employee_edit()
             self.registration_feedback = "Funcionário atualizado com sucesso."
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
             self.registration_feedback = self._error_message(
@@ -346,11 +813,11 @@ class AuthState(rx.State):
         if self.employee_delete_busy:
             return
         try:
-            employee_id = int(employee.get("id", 0))
+            employee_id = str(employee.get("id", ""))
         except (TypeError, ValueError):
             self.registration_feedback = "Não foi possível identificar o funcionário."
             return
-        if employee_id <= 0 or not any(
+        if not employee_id or not any(
             str(record.get("id", "")) == str(employee_id)
             for record in self.employees
         ):
@@ -364,7 +831,7 @@ class AuthState(rx.State):
     def close_employee_delete(self) -> None:
         if self.employee_delete_busy:
             return
-        self.employee_delete_id = 0
+        self.employee_delete_id = ""
         self.employee_delete_name = ""
         self.employee_delete_open = False
 
@@ -376,7 +843,7 @@ class AuthState(rx.State):
             self.close_employee_delete()
             return
         employee_id = self.employee_delete_id
-        if not self._auth_token or employee_id <= 0:
+        if not self._auth_token or not employee_id:
             self.registration_feedback = "Sua sessão expirou. Faça login novamente."
             self.close_employee_delete()
             return
@@ -397,7 +864,7 @@ class AuthState(rx.State):
                 if str(employee.get("id", "")) != str(employee_id)
             ]
             self.registration_feedback = "Funcionário excluído com sucesso."
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
             if error.status_code == 404:
@@ -429,7 +896,7 @@ class AuthState(rx.State):
         self.product_codigo_de_barra = ""
 
     async def register_product(self) -> Any:
-        if self.user_role not in {"owner", "manager"}:
+        if self.user_role not in {"owner", "manager", "operator"}:
             return rx.toast.error(
                 "Você não tem autorização para cadastrar produtos."
             )
@@ -469,20 +936,18 @@ class AuthState(rx.State):
             )
             self._clear_product_form()
             return rx.toast.success("Produto cadastrado com sucesso.")
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
                 return rx.redirect("/login")
             if error.status_code in {400, 409}:
-                if "duplicate" in error.code.lower() or "unique" in error.message.lower():
+                if error.status_code == 409 or error.code == "23505":
                     return rx.toast.error(
                         "Já existe um produto com este código de barras."
                     )
-                return rx.toast.error(
-                    "Os dados do produto foram rejeitados pelo Xano."
-                )
+                return rx.toast.error("Os dados do produto foram rejeitados.")
             if error.status_code == 0:
-                return rx.toast.error("Não foi possível conectar ao Xano.")
+                return rx.toast.error("Não foi possível conectar ao Supabase.")
             return rx.toast.error(error.message)
         finally:
             self.is_busy = False
@@ -513,12 +978,6 @@ class AuthState(rx.State):
             if query in " ".join(record.values()).lower()
         ]
 
-    async def require_admin_and_load_inventory(self) -> Any:
-        result = await self.require_admin()
-        if result is not None:
-            return result
-        return await self.load_inventory()
-
     async def load_inventory(self) -> Any:
         if not self._auth_token:
             self._clear_session()
@@ -529,7 +988,7 @@ class AuthState(rx.State):
             products_by_id = {
                 product.get("id"): product
                 for product in products
-                if isinstance(product.get("id"), int)
+                if isinstance(product.get("id"), str)
             }
             self.inventory_records = [
                 {
@@ -548,7 +1007,7 @@ class AuthState(rx.State):
                 }
                 for record in inventory
             ]
-        except XanoApiError as error:
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
                 return rx.redirect("/login")
@@ -565,11 +1024,11 @@ class AuthState(rx.State):
         ]
         weight = str(product.get("peso", "")).strip()
         if weight:
-            product_name.append(f"{weight} g")
+            product_name.append(format_weight_grams(weight))
         return " ".join(product_name)
 
     async def add_inventory(self) -> Any:
-        if self.user_role not in {"owner", "manager"}:
+        if self.user_role not in {"owner", "manager", "operator"}:
             return rx.toast.error(
                 "Você não tem autorização para atualizar o estoque."
             )
@@ -591,49 +1050,23 @@ class AuthState(rx.State):
 
         self.is_busy = True
         try:
-            async with INVENTORY_OPERATION_LOCK:
-                products = await list_products(self._auth_token)
-                product = next(
-                    (
-                        item
-                        for item in products
-                        if item.get("codigo_de_barra") == codigo
-                    ),
-                    None,
-                )
-                if product is None or not isinstance(product.get("id"), int):
-                    return rx.toast.error("Nenhum produto encontrado para este código.")
-
-                inventory = await list_inventory(self._auth_token)
-                existing = find_inventory_record(inventory, product["id"], validade)
-                if existing is not None and isinstance(existing.get("id"), int):
-                    current_units = parse_inventory_units(
-                        str(existing.get("unidades", ""))
-                    )
-                    if current_units is None:
-                        return rx.toast.error(
-                            "O Xano retornou uma quantidade inválida no estoque."
-                        )
-                    await update_inventory_lot(
-                        self._auth_token,
-                        existing["id"],
-                        current_units + unidades,
-                    )
-                else:
-                    await create_inventory_lot(
-                        self._auth_token,
-                        product["id"],
-                        unidades,
-                        validade,
-                        lote,
-                    )
-                self.conference_codigo = ""
-                self.conference_lote = ""
-                self.conference_unidades = ""
-                self.conference_validade = ""
-                await self.load_inventory()
-                return rx.toast.success("Estoque atualizado com sucesso.")
-        except XanoApiError as error:
+            product = await find_product_by_barcode(self._auth_token, codigo)
+            if product is None:
+                return rx.toast.error("Nenhum produto encontrado para este código.")
+            await create_inventory_lot(
+                self._auth_token,
+                str(product["id"]),
+                unidades,
+                validade,
+                lote,
+            )
+            self.conference_codigo = ""
+            self.conference_lote = ""
+            self.conference_unidades = ""
+            self.conference_validade = ""
+            await self.load_inventory()
+            return rx.toast.success("Estoque atualizado com sucesso.")
+        except SupabaseApiError as error:
             if error.status_code == 401:
                 self._clear_session()
                 return rx.redirect("/login")
@@ -1219,52 +1652,7 @@ def dashboard_cards() -> rx.Component:
 
 
 class PricesState(rx.State):
-    mock_products: list[dict[str, str]] = [
-        {
-            "product": "Salgadinho Doritos 37 g",
-            "barcode": "7892840816469",
-            "type": "Salgadinho",
-            "brand": "Doritos",
-            "weight": "37 g",
-        },
-        {
-            "product": "Arroz Tio Urbano 5000 g",
-            "barcode": "7896290300011",
-            "type": "Arroz",
-            "brand": "Tio Urbano",
-            "weight": "5000 g",
-        },
-        {
-            "product": "Margarina Qualy 500 g",
-            "barcode": "7891000205023",
-            "type": "Margarina",
-            "brand": "Qualy",
-            "weight": "500 g",
-        },
-    ]
-    mock_prices: list[dict[str, str]] = [
-        {
-            "product": "Salgadinho Doritos 37 g",
-            "barcode": "7892840816469",
-            "brand": "Doritos",
-            "price": "R$ 5,99",
-            "date": "16/10/2026",
-        },
-        {
-            "product": "Arroz Tio Urbano 5000 g",
-            "barcode": "7896290300011",
-            "brand": "Tio Urbano",
-            "price": "R$ 24,90",
-            "date": "16/10/2026",
-        },
-        {
-            "product": "Margarina Qualy 500 g",
-            "barcode": "7891000205023",
-            "brand": "Qualy",
-            "price": "R$ 8,49",
-            "date": "16/10/2026",
-        },
-    ]
+    prices: list[dict[str, str]] = []
     barcode_input: str = ""
     price_input: str = ""
     price_search_input: str = ""
@@ -1273,23 +1661,86 @@ class PricesState(rx.State):
     has_selected_product: bool = False
     feedback: str = ""
     feedback_is_error: bool = False
+    saving_price: bool = False
 
     def set_barcode_input(self, value: str) -> None:
+        if self.saving_price:
+            return
         self.barcode_input = value
+        self.selected_product = {}
+        self.has_selected_product = False
+        self.feedback = ""
+        self.feedback_is_error = False
 
     def set_price_input(self, value: str) -> None:
         self.price_input = value
 
     def set_price_search_input(self, value: str) -> None:
         self.price_search_input = value
+        self.applied_price_search = value
 
-    def search_mock_product(self) -> None:
+    def search_prices(self) -> None:
+        self.applied_price_search = self.price_search_input
+
+    async def _authorized_token(self) -> tuple[str | None, Any]:
+        auth_state = await self.get_state(AuthState)
+        redirect = await auth_state.require_admin()
+        if redirect is not None:
+            return None, redirect
+        return auth_state._auth_token, None
+
+    async def load_prices(self) -> Any:
+        token, redirect = await self._authorized_token()
+        if redirect is not None:
+            return redirect
+        if not token:
+            return rx.redirect("/login")
+        try:
+            rows = await list_current_prices(token)
+            self.prices = [self._format_price_row(row) for row in rows]
+            self.feedback = ""
+            self.feedback_is_error = False
+        except SupabaseApiError as error:
+            self.feedback = error.message
+            self.feedback_is_error = True
+
+    async def search_product(self) -> Any:
+        if self.saving_price:
+            return
+        self.selected_product = {}
+        self.has_selected_product = False
+        token, redirect = await self._authorized_token()
+        if redirect is not None:
+            return redirect
+        if not token:
+            return rx.redirect("/login")
         barcode = self.barcode_input.strip()
-        product = next(
-            (item for item in self.mock_products if item["barcode"] == barcode),
-            None,
-        )
-        self.selected_product = product or {}
+        if not barcode:
+            self.selected_product = {}
+            self.has_selected_product = False
+            self.feedback = "Informe um código de barras para pesquisar."
+            self.feedback_is_error = True
+            return
+        try:
+            product = await find_product_by_barcode(token, barcode)
+            self.selected_product = (
+                {
+                    "id": str(product["id"]),
+                    "product": self._product_name(product),
+                    "barcode": str(product["codigo_de_barra"]),
+                    "type": str(product["tipo"]),
+                    "brand": str(product["marca"]),
+                    "weight": format_weight_grams(product["peso"]),
+                }
+                if product is not None
+                else {}
+            )
+        except SupabaseApiError as error:
+            self.selected_product = {}
+            self.has_selected_product = False
+            self.feedback = error.message
+            self.feedback_is_error = True
+            return
         self.has_selected_product = product is not None
         self.feedback = (
             "Produto encontrado."
@@ -1298,62 +1749,107 @@ class PricesState(rx.State):
         )
         self.feedback_is_error = product is None
 
-    def link_mock_price(self) -> None:
+    @staticmethod
+    def _product_name(product: dict[str, Any]) -> str:
+        return " ".join(
+            (
+                str(product["tipo"]).strip(),
+                str(product["marca"]).strip(),
+                format_weight_grams(product["peso"]),
+            )
+        )
+
+    @staticmethod
+    def _format_price_row(row: dict[str, Any]) -> dict[str, str]:
+        cents = int(row["price_cents"])
+        amount = f"{cents // 100},{cents % 100:02d}"
+        timestamp = str(row["price_created_at"])
+        product_name = str(row["product_name"])
+        weight_grams = row.get("weight_grams")
+        if weight_grams is not None and product_name.endswith(" g"):
+            formatted_weight = format_weight_grams(weight_grams)[:-2]
+            name_prefix, separator, _ = product_name[:-2].rpartition(" ")
+            if separator:
+                product_name = f"{name_prefix} {formatted_weight} g"
+        try:
+            registered_datetime = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if registered_datetime.tzinfo is None:
+                registered_datetime = registered_datetime.replace(tzinfo=timezone.utc)
+            registered_at = registered_datetime.astimezone(
+                timezone(timedelta(hours=-3))
+            ).strftime("%d/%m/%Y %H:%M")
+        except ValueError as error:
+            raise SupabaseApiError(
+                502,
+                "invalid_response",
+                "O Supabase retornou uma data de preço inválida.",
+            ) from error
+        return {
+            "product": product_name,
+            "barcode": str(row["barcode"]),
+            "brand": str(row["brand"]),
+            "price": f"R$ {amount}",
+            "date": registered_at,
+            "search": " ".join(
+                (
+                    str(row["product_name"]),
+                    str(row["barcode"]),
+                    str(row["brand"]),
+                )
+            ).casefold(),
+        }
+
+    async def save_price(self) -> Any:
+        if self.saving_price:
+            return
         if not self.has_selected_product:
             self.feedback = "Pesquise um produto pelo código de barras primeiro."
             self.feedback_is_error = True
             return
+        if self.barcode_input.strip() != self.selected_product.get("barcode"):
+            self.selected_product = {}
+            self.has_selected_product = False
+            self.feedback = "Pesquise novamente o código de barras antes de vincular o preço."
+            self.feedback_is_error = True
+            return
 
-        try:
-            price = Decimal(self.price_input.strip().replace(",", "."))
-        except InvalidOperation:
-            price = Decimal("0")
-        if not price.is_finite() or price <= 0:
+        price_cents = validate_price_cents(self.price_input)
+        if price_cents is None:
             self.feedback = "Digite um preço válido."
             self.feedback_is_error = True
             return
 
-        product = self.selected_product
-        formatted_price = f"R$ {price:.2f}".replace(".", ",")
-        updated = {
-            "product": product["product"],
-            "barcode": product["barcode"],
-            "brand": product["brand"],
-            "price": formatted_price,
-            "date": "16/10/2026",
-        }
-        existing_index = next(
-            (
-                index
-                for index, record in enumerate(self.mock_prices)
-                if record["barcode"] == product["barcode"]
-            ),
-            None,
-        )
-        if existing_index is None:
-            self.mock_prices = [updated, *self.mock_prices]
-        else:
-            self.mock_prices[existing_index] = updated
-            self.mock_prices = list(self.mock_prices)
-        self.feedback = "Preço vinculado localmente."
-        self.feedback_is_error = False
-        self.price_input = ""
-
-    def search_mock_prices(self) -> None:
-        self.applied_price_search = self.price_search_input.strip().casefold()
+        token, redirect = await self._authorized_token()
+        if redirect is not None:
+            return redirect
+        if not token:
+            return rx.redirect("/login")
+        self.saving_price = True
+        try:
+            await create_product_price(
+                token,
+                self.selected_product["id"],
+                price_cents,
+            )
+            self.price_input = ""
+            await self.load_prices()
+            if self.feedback_is_error:
+                self.feedback = (
+                    "Preço vinculado, mas a lista não pôde ser atualizada. "
+                    f"{self.feedback}"
+                )
+            else:
+                self.feedback = "Preço vinculado com sucesso."
+                self.feedback_is_error = False
+        except SupabaseApiError as error:
+            self.feedback = error.message
+            self.feedback_is_error = True
+        finally:
+            self.saving_price = False
 
     @rx.var
-    def filtered_mock_prices(self) -> list[dict[str, str]]:
-        query = self.applied_price_search
-        if not query:
-            return self.mock_prices
-        return [
-            price
-            for price in self.mock_prices
-            if query in price["product"].casefold()
-            or query in price["barcode"].casefold()
-            or query in price["brand"].casefold()
-        ]
+    def filtered_prices(self) -> list[dict[str, str]]:
+        return filter_prices(self.prices, self.applied_price_search)
 
 
 def prices_table_row(price: dict[str, str]) -> rx.Component:
@@ -1400,6 +1896,15 @@ def prices_panel() -> rx.Component:
             "color": "#000000",
         },
     }
+    search_input_style = {
+        "width": "100%",
+        "height": "3.1rem",
+        "background": "#F7F9FC",
+        "color": "#000000",
+        "border": "1px solid #E5E7EB",
+        "border_radius": "0.7rem",
+        "_placeholder": {"color": "#5B6475", "opacity": "1"},
+    }
     primary_button_style = {
         "height": "3.1rem",
         "border_radius": "0.7rem",
@@ -1428,12 +1933,15 @@ def prices_panel() -> rx.Component:
                                 aria_label="Código de barras do produto",
                                 value=PricesState.barcode_input,
                                 on_change=PricesState.set_barcode_input,
+                                disabled=PricesState.saving_price,
+                                class_name="prices-input",
                                 **input_style,
                             ),
                             rx.button(
                                 rx.icon("search", size=19),
                                 aria_label="Pesquisar código de barras",
-                                on_click=PricesState.search_mock_product,
+                                on_click=PricesState.search_product,
+                                disabled=PricesState.saving_price,
                                 width="3.1rem",
                                 min_width="3.1rem",
                                 **primary_button_style,
@@ -1451,6 +1959,8 @@ def prices_panel() -> rx.Component:
                             aria_label="Preço do produto",
                             value=PricesState.price_input,
                             on_change=PricesState.set_price_input,
+                            disabled=PricesState.saving_price,
+                            class_name="prices-input",
                             **input_style,
                         ),
                     ),
@@ -1463,7 +1973,8 @@ def prices_panel() -> rx.Component:
                 rx.button(
                     "Vincular Preço",
                     type="button",
-                    on_click=PricesState.link_mock_price,
+                    on_click=PricesState.save_price,
+                    disabled=PricesState.saving_price,
                     width="100%",
                     **primary_button_style,
                 ),
@@ -1539,25 +2050,13 @@ def prices_panel() -> rx.Component:
         rx.box(
             rx.vstack(
                 rx.heading("Consultar Preços", size="5", color="#172033"),
-                rx.hstack(
-                    rx.input(
-                        placeholder="Digite o código de barras, nome do produto ou marca",
-                        aria_label="Consultar preços por código, nome ou marca",
-                        value=PricesState.price_search_input,
-                        on_change=PricesState.set_price_search_input,
-                        **input_style,
-                    ),
-                    rx.button(
-                        rx.hstack(rx.text("Consultar"), rx.icon("search", size=18), gap="0.5rem"),
-                        type="button",
-                        on_click=PricesState.search_mock_prices,
-                        **primary_button_style,
-                        padding="0 1.2rem",
-                    ),
-                    width="100%",
-                    gap="0.75rem",
-                    align="center",
-                    class_name="prices-search-row",
+                rx.input(
+                    placeholder="Digite o código de barras, nome do produto ou marca",
+                    aria_label="Consultar preços por código, nome ou marca",
+                    value=PricesState.price_search_input,
+                    on_change=PricesState.set_price_search_input,
+                    class_name="prices-search-input",
+                    **search_input_style,
                 ),
                 rx.heading("Preços cadastrados", size="4", color="#172033", margin_top="0.5rem"),
                 rx.box(
@@ -1574,8 +2073,8 @@ def prices_panel() -> rx.Component:
                 ),
                 rx.box(
                     rx.cond(
-                        PricesState.filtered_mock_prices.length() > 0,
-                        rx.foreach(PricesState.filtered_mock_prices, prices_table_row),
+                        PricesState.filtered_prices.length() > 0,
+                        rx.foreach(PricesState.filtered_prices, prices_table_row),
                         rx.text(
                             "Nenhum preço encontrado.",
                             color="#5B6475",
@@ -1620,7 +2119,7 @@ def reports_cards() -> rx.Component:
 
 
 def cashier_table_cell(
-    content: str,
+    content: Any,
     *,
     header: bool = False,
     last: bool = False,
@@ -1629,25 +2128,44 @@ def cashier_table_cell(
         rx.text(
             content,
             color="#172033",
-            font_size="clamp(0.7rem, 1.3vw, 0.92rem)",
+            font_size="clamp(0.78rem, 1vw, 0.94rem)",
             font_weight="700" if header else "400",
-            line_height="1.25",
-            text_align="center",
+            line_height="1.4",
+            text_align="left" if header and content == "Nome" else "center",
             width="100%",
         ),
-        padding="0.8rem 0.55rem",
+        padding="1rem 0.75rem",
         min_width="0",
-        min_height="2.9rem",
+        min_height="3.25rem",
         display="flex",
         align_items="center",
         justify_content="center",
-        border_right="none" if last else "1px solid #DDE3EC",
+        border_right="none" if last else "1px solid #E8EDF4",
+    )
+
+
+def cashier_table_row(item: dict[str, str]) -> rx.Component:
+    columns = (
+        item["product_name"],
+        item["quantity"],
+        item["barcode"],
+        item["unit_price"],
+        item["line_total"],
+    )
+    return rx.box(
+        *[
+            cashier_table_cell(value, last=index == len(columns) - 1)
+            for index, value in enumerate(columns)
+        ],
+        display="grid",
+        grid_template_columns="minmax(0, 2fr) minmax(3.5rem, 0.65fr) minmax(6.5rem, 1.2fr) minmax(6rem, 1fr) minmax(6rem, 1fr)",
+        border_bottom="1px solid #EEF1F5",
+        width="100%",
     )
 
 
 def cashier_table() -> rx.Component:
     columns = ("Nome", "Qnt.", "Código", "Valor Unit.", "Total")
-    empty_rows = [("", "", "", "", "") for _ in range(6)]
     header = [
         cashier_table_cell(
             column,
@@ -1656,34 +2174,121 @@ def cashier_table() -> rx.Component:
         )
         for index, column in enumerate(columns)
     ]
-    rows = [
-        cashier_table_cell(value, last=index == len(columns) - 1)
-        for row in empty_rows
-        for index, value in enumerate(row)
-    ]
-
     return rx.box(
         rx.box(
             *header,
             display="grid",
-            grid_template_columns="2fr 0.7fr 1.2fr 1fr 1fr",
-            border_bottom="1px solid #BFC8D6",
+            grid_template_columns="minmax(0, 2fr) minmax(3.5rem, 0.65fr) minmax(6.5rem, 1.2fr) minmax(6rem, 1fr) minmax(6rem, 1fr)",
+            background="#F7F9FC",
+            border_bottom="1px solid #E3E8F0",
         ),
         rx.box(
-            *rows,
-            display="grid",
-            grid_template_columns="2fr 0.7fr 1.2fr 1fr 1fr",
-            grid_template_rows="repeat(6, minmax(2.9rem, 1fr))",
+            rx.cond(
+                AuthState.cashier_items.length() > 0,
+                rx.foreach(AuthState.cashier_items, cashier_table_row),
+                rx.text(
+                    "Nenhum item incluído.",
+                    color="#64748B",
+                    text_align="center",
+                    padding="1.5rem 0.75rem",
+                    grid_column="1 / -1",
+                ),
+            ),
+            width="100%",
         ),
         width="100%",
         overflow_x="auto",
         border="1px solid #E3E8F0",
-        border_radius="0.65rem",
+        border_radius="0.85rem",
+        class_name="cashier-items-table",
+    )
+
+
+def cashier_payment_option(
+    method: str,
+    title: str,
+    description: str,
+    icon: str,
+) -> rx.Component:
+    selected = AuthState.cashier_selected_payment_method == method
+    return rx.button(
+        rx.hstack(
+            rx.box(
+                rx.icon(icon, size=22, color="#2467C7", aria_hidden="true"),
+                display="flex",
+                align_items="center",
+                justify_content="center",
+                width="3rem",
+                height="3rem",
+                flex_shrink="0",
+                background="#EFF6FF",
+                border_radius="50%",
+            ),
+            rx.vstack(
+                rx.text(
+                    title,
+                    color="#172B4D",
+                    font_size="1rem",
+                    font_weight="700",
+                    text_align="left",
+                ),
+                rx.text(
+                    description,
+                    color="#64748B",
+                    font_size="0.875rem",
+                    text_align="left",
+                ),
+                align="start",
+                gap="0.25rem",
+                min_width="0",
+            ),
+            rx.icon(
+                "chevron-right",
+                size=20,
+                color="#2467C7",
+                aria_hidden="true",
+                margin_left="auto",
+                flex_shrink="0",
+            ),
+            width="100%",
+            align="center",
+            gap="0.85rem",
+        ),
+        type="button",
+        on_click=AuthState.select_cashier_payment_method(method),
+        disabled=AuthState.cashier_busy,
+        aria_pressed=selected,
+        class_name=rx.cond(
+            selected,
+            "cashier-payment-option is-selected",
+            "cashier-payment-option",
+        ),
+        width="100%",
+        min_height="6.6rem",
+        padding="1rem",
+        background="white",
+        border="1px solid #DCE8FF",
+        border_radius="0.8rem",
+        text_align="left",
+        cursor="pointer",
+        transition="border-color 140ms ease, background 140ms ease, box-shadow 140ms ease",
     )
 
 
 def cashier_page_content() -> rx.Component:
     return rx.box(
+        rx.link(
+            rx.icon(
+                "arrow-left",
+                size=21,
+                color="white",
+                stroke_width=2.2,
+                aria_hidden="true",
+            ),
+            href="/caixa-inicio",
+            aria_label="Voltar para a tela inicial",
+            class_name="cashier-back-link",
+        ),
         rx.hstack(
             rx.box(
                 rx.vstack(
@@ -1696,10 +2301,12 @@ def cashier_page_content() -> rx.Component:
                     rx.text(
                         "BIPSYSTEM",
                         color="white",
-                        font_size="clamp(1.5rem, 3vw, 2.5rem)",
-                        font_weight="800",
-                        letter_spacing="0.08em",
+                        font_family="'Segoe Script', 'Brush Script MT', cursive",
+                        font_size="clamp(2rem, 3vw, 2.75rem)",
+                        font_weight="700",
                         text_align="center",
+                        line_height="1.1",
+                        class_name="cashier-brand-name",
                     ),
                     rx.text(
                         "Automação Comercial",
@@ -1709,12 +2316,13 @@ def cashier_page_content() -> rx.Component:
                     ),
                     gap="0.7rem",
                     align="center",
+                    class_name="cashier-brand-content",
                 ),
                 class_name="cashier-brand",
                 display="flex",
                 align_items="center",
                 justify_content="center",
-                width="28%",
+                width="27%",
                 min_width="13rem",
                 padding="2rem 1rem",
             ),
@@ -1727,16 +2335,44 @@ def cashier_page_content() -> rx.Component:
                         font_size="clamp(2rem, 4vw, 3.1rem)",
                         font_weight="700",
                         line_height="1",
+                        class_name="cashier-page-title",
                     ),
-                    rx.text(
-                        "bipsystem.com.br",
-                        color="rgba(255, 255, 255, 0.9)",
-                        font_size="0.9rem",
+                    rx.vstack(
+                        rx.text(
+                            rx.moment(
+                                interval=60_000,
+                                format="HH:mm",
+                                local=True,
+                                locale="pt-br",
+                            ),
+                            color="white",
+                            font_size="clamp(1.7rem, 2.5vw, 2.25rem)",
+                            font_weight="700",
+                            line_height="1.1",
+                            class_name="cashier-page-time",
+                        ),
+                        rx.text(
+                            rx.moment(
+                                interval=60_000,
+                                format="D [de] MMMM [de] YYYY",
+                                local=True,
+                                locale="pt-br",
+                            ),
+                            color="rgba(255, 255, 255, 0.88)",
+                            font_size="0.9rem",
+                            text_align="center",
+                            class_name="cashier-page-date",
+                        ),
+                        align="center",
+                        gap="0.15rem",
                         margin_left="auto",
+                        class_name="cashier-page-clock",
                     ),
                     width="100%",
-                    align="center",
-                    gap="1rem",
+                    align="start",
+                    justify="between",
+                    gap="1.25rem",
+                    class_name="cashier-page-header",
                 ),
                 rx.vstack(
                     rx.box(
@@ -1748,7 +2384,7 @@ def cashier_page_content() -> rx.Component:
                                 font_weight="700",
                             ),
                             rx.text(
-                                "1234,00 R$",
+                                AuthState.cashier_total_display,
                                 color="#172033",
                                 font_size="clamp(1.7rem, 4vw, 2.8rem)",
                                 font_weight="800",
@@ -1759,56 +2395,709 @@ def cashier_page_content() -> rx.Component:
                         ),
                         width="100%",
                         background="white",
-                        border_radius="0.9rem",
-                        box_shadow="0 8px 22px rgba(23, 32, 51, 0.12)",
-                        padding="1.25rem clamp(1.1rem, 3vw, 2rem)",
+                        border="1px solid rgba(255, 255, 255, 0.7)",
+                        border_radius="1.1rem",
+                        box_shadow="0 12px 30px rgba(23, 32, 51, 0.13)",
+                        padding="clamp(1.5rem, 3vw, 2.25rem)",
+                        class_name="cashier-total-card",
                     ),
                     rx.box(
                         rx.vstack(
+                            rx.hstack(
+                                rx.heading(
+                                    "Inclusão de produtos",
+                                    color="#172033",
+                                    font_size="1.1rem",
+                                    font_weight="700",
+                                ),
+                                rx.button(
+                                    rx.cond(
+                                        AuthState.cashier_entry_open,
+                                        "Fechar inclusão",
+                                        "Reabrir inclusão",
+                                    ),
+                                    type="button",
+                                    on_click=AuthState.toggle_cashier_entry,
+                                    disabled=AuthState.cashier_purchase_status != "open",
+                                    margin_left="auto",
+                                    background="#EFF6FF",
+                                    color="#2467C7",
+                                    border_radius="0.55rem",
+                                ),
+                                width="100%",
+                                align="center",
+                                gap="0.75rem",
+                                class_name="cashier-entry-heading",
+                            ),
+                            rx.cond(
+                                AuthState.cashier_entry_open,
+                                rx.form(
+                                    rx.hstack(
+                                        rx.input(
+                                            name="barcode",
+                                            type="text",
+                                            placeholder="Digite ou escaneie o código de barra",
+                                            aria_label="Código de barras do produto",
+                                            value=AuthState.cashier_barcode,
+                                            on_change=AuthState.set_cashier_barcode,
+                                            auto_focus=True,
+                                            flex="1",
+                                            min_width="0",
+                                            height="3.1rem",
+                                            padding="0 1rem",
+                                            background="#F7F9FC",
+                                            color="#000000",
+                                            font_size="0.95rem",
+                                            border="1px solid #E5E7EB",
+                                            border_radius="0.7rem",
+                                            class_name="cashier-entry-input",
+                                            _placeholder={
+                                                "color": "#000000",
+                                                "opacity": "1",
+                                            },
+                                            _hover={
+                                                "background": "#F7F9FC",
+                                                "border_color": "#E5E7EB",
+                                                "color": "#000000",
+                                            },
+                                            _focus={
+                                                "background": "#F7F9FC",
+                                                "border_color": "#93C5FD",
+                                                "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2)",
+                                                "color": "#000000",
+                                            },
+                                            _focus_visible={
+                                                "background": "#F7F9FC",
+                                                "border_color": "#93C5FD",
+                                                "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2)",
+                                                "color": "#000000",
+                                            },
+                                            _active={
+                                                "background": "#F7F9FC",
+                                                "color": "#000000",
+                                            },
+                                        ),
+                                        rx.input(
+                                            name="quantity",
+                                            type="text",
+                                            placeholder="Quantidade",
+                                            aria_label="Quantidade do produto",
+                                            value=AuthState.cashier_quantity,
+                                            on_change=AuthState.set_cashier_quantity,
+                                            width="7.5rem",
+                                            height="3.1rem",
+                                            padding="0 1rem",
+                                            background="#F7F9FC",
+                                            color="#000000",
+                                            font_size="0.95rem",
+                                            border="1px solid #E5E7EB",
+                                            border_radius="0.7rem",
+                                            class_name="cashier-entry-input",
+                                            _placeholder={
+                                                "color": "#000000",
+                                                "opacity": "1",
+                                            },
+                                            _hover={
+                                                "background": "#F7F9FC",
+                                                "border_color": "#E5E7EB",
+                                                "color": "#000000",
+                                            },
+                                            _focus={
+                                                "background": "#F7F9FC",
+                                                "border_color": "#93C5FD",
+                                                "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2)",
+                                                "color": "#000000",
+                                            },
+                                            _focus_visible={
+                                                "background": "#F7F9FC",
+                                                "border_color": "#93C5FD",
+                                                "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2)",
+                                                "color": "#000000",
+                                            },
+                                            _active={
+                                                "background": "#F7F9FC",
+                                                "color": "#000000",
+                                            },
+                                        ),
+                                        rx.button(
+                                            "Adicionar",
+                                            type="submit",
+                                            disabled=AuthState.cashier_busy
+                                            | (AuthState.cashier_purchase_status != "open"),
+                                            height="3rem",
+                                            padding="0 1.2rem",
+                                            background="#307CE8",
+                                            color="white",
+                                            border_radius="0.55rem",
+                                            font_weight="700",
+                                        ),
+                                        width="100%",
+                                        align="center",
+                                        gap="0.65rem",
+                                        class_name="cashier-entry-fields",
+                                    ),
+                                    on_submit=AuthState.add_cashier_item,
+                                    reset_on_submit=False,
+                                    width="100%",
+                                ),
+                                rx.text(
+                                    "A inclusão de produtos está fechada.",
+                                    color="#64748B",
+                                ),
+                            ),
+                            rx.text(
+                                AuthState.cashier_feedback,
+                                role="status",
+                                color="#2467C7",
+                                min_height="1.2rem",
+                            ),
                             rx.heading(
                                 "Itens da compra",
                                 color="#172033",
-                                font_size="1.1rem",
+                                font_size="1.2rem",
                                 font_weight="700",
-                                margin_bottom="0.15rem",
+                                margin_top="0.6rem",
+                                class_name="cashier-items-heading",
                             ),
                             cashier_table(),
+                            rx.cond(
+                                AuthState.cashier_cancel_confirmation_open,
+                                rx.hstack(
+                                    rx.text(
+                                        "Cancelar a compra? Os itens serão mantidos no histórico.",
+                                        color="#172033",
+                                    ),
+                                    rx.button(
+                                        "Confirmar cancelamento",
+                                        type="button",
+                                        on_click=AuthState.cancel_cashier_sale,
+                                        disabled=AuthState.cashier_busy,
+                                        background="#DC2626",
+                                        color="white",
+                                    ),
+                                    rx.button(
+                                        "Voltar",
+                                        type="button",
+                                        on_click=AuthState.dismiss_cashier_cancel_confirmation,
+                                        background="#E2E8F0",
+                                        color="#172033",
+                                    ),
+                                    align="center",
+                                    flex_wrap="wrap",
+                                    gap="0.6rem",
+                                    width="100%",
+                                ),
+                                rx.fragment(),
+                            ),
+                            rx.cond(
+                                AuthState.cashier_purchase_status == "open",
+                                rx.hstack(
+                                    rx.dialog.root(
+                                        rx.dialog.trigger(
+                                            rx.button(
+                                                "Finalizar compra",
+                                                type="button",
+                                                disabled=AuthState.cashier_busy
+                                                | (AuthState.cashier_items.length() == 0),
+                                                background="#15803D",
+                                                color="white",
+                                            ),
+                                            as_child=True,
+                                        ),
+                                        rx.dialog.content(
+                                            rx.vstack(
+                                                rx.hstack(
+                                                    rx.box(
+                                                        rx.icon(
+                                                            "credit-card",
+                                                            size=23,
+                                                            color="#2467C7",
+                                                            aria_hidden="true",
+                                                        ),
+                                                        display="flex",
+                                                        align_items="center",
+                                                        justify_content="center",
+                                                        width="3rem",
+                                                        height="3rem",
+                                                        flex_shrink="0",
+                                                        background="#EFF6FF",
+                                                        border_radius="50%",
+                                                    ),
+                                                    rx.box(
+                                                        width="1px",
+                                                        height="3rem",
+                                                        flex_shrink="0",
+                                                        background="#DCE8FF",
+                                                    ),
+                                                    rx.vstack(
+                                                        rx.dialog.title(
+                                                            "Escolha o método de pagamento",
+                                                            color="#1D4F91",
+                                                            font_size="clamp(1.15rem, 2.5vw, 1.45rem)",
+                                                            font_weight="700",
+                                                            line_height="1.25",
+                                                            margin="0",
+                                                        ),
+                                                        rx.dialog.description(
+                                                            "Selecione como o cliente deseja realizar o pagamento.",
+                                                            color="#64748B",
+                                                            font_size="0.9rem",
+                                                        ),
+                                                        align="start",
+                                                        gap="0.35rem",
+                                                        min_width="0",
+                                                    ),
+                                                    rx.dialog.close(
+                                                        rx.button(
+                                                            rx.icon(
+                                                                "x",
+                                                                size=20,
+                                                                color="#2467C7",
+                                                                aria_hidden="true",
+                                                            ),
+                                                            type="button",
+                                                            aria_label="Fechar seleção de pagamento",
+                                                            disabled=AuthState.cashier_busy,
+                                                            class_name="cashier-payment-close",
+                                                            variant="ghost",
+                                                        ),
+                                                        as_child=True,
+                                                        on_click=AuthState.close_cashier_payment_modal,
+                                                    ),
+                                                    width="100%",
+                                                    align="center",
+                                                    gap="0.85rem",
+                                                    class_name="cashier-payment-header",
+                                                ),
+                                                rx.grid(
+                                                    cashier_payment_option(
+                                                        "credit_card",
+                                                        "Cartão de crédito",
+                                                        "Parcela em até 12x",
+                                                        "credit-card",
+                                                    ),
+                                                    cashier_payment_option(
+                                                        "debit_card",
+                                                        "Cartão de débito",
+                                                        "Pagamento à vista",
+                                                        "credit-card",
+                                                    ),
+                                                    cashier_payment_option(
+                                                        "pix",
+                                                        "Pix",
+                                                        "Pagamento instantâneo",
+                                                        "qr-code",
+                                                    ),
+                                                    cashier_payment_option(
+                                                        "cash",
+                                                        "Dinheiro",
+                                                        "Pagamento em espécie",
+                                                        "banknote",
+                                                    ),
+                                                    columns="2",
+                                                    spacing="3",
+                                                    width="100%",
+                                                    class_name="cashier-payment-grid",
+                                                ),
+                                                rx.cond(
+                                                    AuthState.cashier_busy,
+                                                    rx.hstack(
+                                                        rx.spinner(color="#2467C7"),
+                                                        rx.text(
+                                                            "Finalizando venda...",
+                                                            color="#1D4F91",
+                                                            font_weight="600",
+                                                        ),
+                                                        role="status",
+                                                        aria_live="polite",
+                                                        align="center",
+                                                        gap="0.65rem",
+                                                        min_height="1.5rem",
+                                                    ),
+                                                    rx.text(
+                                                        AuthState.cashier_payment_feedback,
+                                                        role="status",
+                                                        aria_live="polite",
+                                                        color="#9A3412",
+                                                        font_size="0.875rem",
+                                                        font_weight="600",
+                                                        min_height="1.25rem",
+                                                    ),
+                                                ),
+                                                width="100%",
+                                                align="stretch",
+                                                gap="1rem",
+                                            ),
+                                            class_name="cashier-payment-dialog",
+                                        ),
+                                        open=AuthState.cashier_payment_modal_open,
+                                        on_open_change=AuthState.set_cashier_payment_modal_open,
+                                    ),
+                                    rx.button(
+                                        "Cancelar compra",
+                                        type="button",
+                                        on_click=AuthState.open_cashier_cancel_confirmation,
+                                        disabled=AuthState.cashier_busy
+                                        | AuthState.cashier_cancel_confirmation_open,
+                                        background="#FEE2E2",
+                                        color="#B91C1C",
+                                    ),
+                                    width="100%",
+                                    justify="end",
+                                    gap="0.65rem",
+                                    class_name="cashier-purchase-actions",
+                                ),
+                                rx.cond(
+                                    (AuthState.cashier_purchase_status == "completed")
+                                    | (AuthState.cashier_purchase_status == "cancelled"),
+                                    rx.hstack(
+                                        rx.text(
+                                            rx.cond(
+                                                AuthState.cashier_purchase_status == "completed",
+                                                "Compra finalizada",
+                                                "Compra cancelada",
+                                            ),
+                                            color="#475569",
+                                            font_weight="700",
+                                        ),
+                                        rx.button(
+                                            "Nova compra",
+                                            type="button",
+                                            on_click=AuthState.start_new_cashier_sale,
+                                            disabled=AuthState.cashier_busy,
+                                            margin_left="auto",
+                                            background="#307CE8",
+                                            color="white",
+                                        ),
+                                        width="100%",
+                                        align="center",
+                                    ),
+                                    rx.fragment(),
+                                ),
+                            ),
                             width="100%",
                             align="stretch",
-                            gap="0.9rem",
+                            gap="0.75rem",
                         ),
                         width="100%",
                         background="white",
-                        border_radius="0.9rem",
-                        box_shadow="0 8px 22px rgba(23, 32, 51, 0.12)",
-                        padding="clamp(1rem, 2.5vw, 1.6rem)",
+                        border="1px solid #E8EDF4",
+                        border_radius="1.1rem",
+                        box_shadow="0 12px 30px rgba(23, 32, 51, 0.1)",
+                        padding="clamp(1.35rem, 2.8vw, 2rem)",
+                        class_name="cashier-products-card",
                     ),
                     width="100%",
-                    gap="1.2rem",
+                    gap="1.5rem",
                     align="stretch",
                 ),
                 class_name="cashier-workspace",
-                width="72%",
+                width="73%",
                 min_width="0",
-                padding="clamp(1rem, 2vw, 2rem) 0",
-                gap="clamp(1.5rem, 4vw, 3rem)",
+                padding="clamp(1.25rem, 2.4vw, 2rem) 0",
+                gap="clamp(1.5rem, 3vw, 2.5rem)",
                 display="flex",
                 flex_direction="column",
             ),
             class_name="cashier-shell",
             width="100%",
-            max_width="90rem",
-            min_height="calc(100vh - 3rem)",
+            max_width="100rem",
+            min_height="calc(100vh - 4rem)",
             margin="0 auto",
             align="stretch",
-            gap="clamp(1rem, 3vw, 3rem)",
+            gap="clamp(1.5rem, 4vw, 3.5rem)",
         ),
         class_name="cashier-page",
         width="100%",
         min_height="100dvh",
-        padding="1.5rem clamp(1rem, 4vw, 4rem)",
-        background="#307CE8",
+        padding="clamp(1.25rem, 3vh, 2.5rem) clamp(1rem, 4vw, 4rem)",
+        background="linear-gradient(135deg, #2872D8 0%, #307CE8 52%, #2467C7 100%)",
         overflow="auto",
+    )
+
+
+def cashier_welcome_feature(
+    icon: str,
+    title: str,
+    description: str,
+    last: bool = False,
+) -> rx.Component:
+    return rx.hstack(
+        rx.icon(icon, size=22, color="white", stroke_width=1.8, aria_hidden="true"),
+        rx.vstack(
+            rx.text(title, color="white", font_weight="700", font_size="0.92rem"),
+            rx.text(description, color="rgba(255, 255, 255, 0.78)", font_size="0.78rem"),
+            align="start",
+            gap="0.2rem",
+        ),
+        width="auto",
+        flex="1",
+        min_width="0",
+        align="center",
+        justify="center",
+        gap="0.85rem",
+        padding="0.75rem 1rem",
+        border_right="none" if last else "1px solid rgba(255, 255, 255, 0.24)",
+        class_name="cashier-welcome-feature",
+    )
+
+
+def cashier_register_illustration() -> rx.Component:
+    return rx.image(
+        src="/logo_bipsystem_branca.png",
+        alt="Caixa registradora",
+        width="clamp(9rem, 9.4vw, 10.5rem)",
+        height="auto",
+        object_fit="contain",
+        margin_top="-55px",
+        class_name="cashier-welcome-register",
+    )
+
+
+def cashier_welcome_page_content() -> rx.Component:
+    return rx.box(
+        rx.box(class_name="cashier-welcome-orb cashier-welcome-orb-one"),
+        rx.box(class_name="cashier-welcome-orb cashier-welcome-orb-two"),
+        rx.box(class_name="cashier-welcome-orb cashier-welcome-orb-three"),
+        rx.box(class_name="cashier-welcome-orb cashier-welcome-orb-four"),
+        rx.hstack(
+            rx.hstack(
+                rx.hstack(
+                    rx.box(
+                        rx.icon("user-round", size=20, color="white", aria_hidden="true"),
+                        width="2.7rem",
+                        height="2.7rem",
+                        display="flex",
+                        align_items="center",
+                        justify_content="center",
+                        border_radius="50%",
+                        background="rgba(255, 255, 255, 0.2)",
+                    ),
+                    rx.vstack(
+                        rx.text(
+                            AuthState.user_name,
+                            color="white",
+                            font_size="0.95rem",
+                            font_weight="700",
+                        ),
+                        rx.text(
+                            "Operador de Caixa",
+                            color="rgba(255, 255, 255, 0.8)",
+                            font_size="0.78rem",
+                        ),
+                        align="start",
+                        gap="0.1rem",
+                    ),
+                    align="center",
+                    gap="0.7rem",
+                    min_width="0",
+                ),
+                rx.box(
+                    width="1px",
+                    height="2rem",
+                    background="rgba(255, 255, 255, 0.35)",
+                    class_name="cashier-welcome-logout-divider",
+                ),
+                rx.button(
+                    rx.hstack(
+                        rx.icon("log-out", size=17, color="white", aria_hidden="true"),
+                        rx.text("Sair", color="white", font_size="0.88rem"),
+                        align="center",
+                        gap="0.35rem",
+                    ),
+                    type="button",
+                    on_click=AuthState.logout,
+                    variant="ghost",
+                    padding="0.5rem 0.65rem",
+                    border_radius="0.5rem",
+                    background="transparent",
+                    _hover={"background": "rgba(255, 255, 255, 0.14)"},
+                    _focus_visible={
+                        "outline": "2px solid white",
+                        "outline_offset": "2px",
+                    },
+                ),
+                class_name="cashier-welcome-identity",
+                align="center",
+                gap="0.8rem",
+            ),
+            rx.vstack(
+                rx.text(
+                    rx.moment(
+                        interval=60_000,
+                        format="HH:mm",
+                        local=True,
+                        locale="pt-br",
+                    ),
+                    color="white",
+                    font_size="clamp(3rem, 3vw, 3.375rem)",
+                    font_weight="700",
+                    line_height="1.1",
+                    class_name="cashier-welcome-time",
+                ),
+                rx.text(
+                    rx.moment(
+                        interval=60_000,
+                        format="D [de] MMMM [de] YYYY",
+                        local=True,
+                        locale="pt-br",
+                    ),
+                    color="rgba(255, 255, 255, 0.82)",
+                    font_size="clamp(1.125rem, 1.1vw, 1.25rem)",
+                    class_name="cashier-welcome-date",
+                ),
+                align="center",
+                gap="0.25rem",
+                margin_left="auto",
+                text_align="center",
+                class_name="cashier-welcome-clock",
+            ),
+            width="100%",
+            align="start",
+            justify="between",
+            gap="1rem",
+            class_name="cashier-welcome-header",
+        ),
+        rx.vstack(
+            rx.box(class_name="cashier-welcome-top-space"),
+            rx.vstack(
+                rx.heading(
+                    "BIPSYSTEM",
+                    color="white",
+                    font_family="'Segoe Script', 'Brush Script MT', cursive",
+                    font_size="clamp(2.5rem, 3vw, 3.375rem)",
+                    font_weight="700",
+                    letter_spacing="0.04em",
+                    line_height="1",
+                    text_align="center",
+                    class_name="cashier-welcome-brand",
+                ),
+                cashier_register_illustration(),
+                rx.vstack(
+                    rx.heading(
+                        "Bem-vindo!",
+                        color="white",
+                        font_size="clamp(2rem, 3.4vw, 2.8rem)",
+                        font_weight="800",
+                        line_height="1.05",
+                        text_align="center",
+                    ),
+                    rx.text(
+                        "Sistema de Automação Comercial",
+                        color="white",
+                        font_size="clamp(1.05rem, 2vw, 1.45rem)",
+                        font_weight="600",
+                        text_align="center",
+                    ),
+                    rx.text(
+                        "Agilidade, controle e praticidade para o seu negócio.",
+                        color="rgba(255, 255, 255, 0.82)",
+                        font_size="0.98rem",
+                        text_align="center",
+                    ),
+                    align="center",
+                    gap="0.55rem",
+                    margin_top="70px",
+                    class_name="cashier-welcome-greeting",
+                ),
+                align="center",
+                gap="0",
+                class_name="cashier-welcome-copy",
+            ),
+            rx.box(
+                rx.button(
+                    rx.hstack(
+                        rx.icon("shopping-cart", size=29, color="#307CE8", aria_hidden="true"),
+                        rx.box(
+                            width="1px",
+                            height="3.2rem",
+                            background="#DDE3EC",
+                            class_name="cashier-welcome-card-divider",
+                        ),
+                        rx.vstack(
+                            rx.text(
+                                "Iniciar Compra",
+                                color="#2467C7",
+                                font_size="1.375rem",
+                                font_weight="700",
+                            ),
+                            rx.text(
+                                "Clique para começar uma nova venda",
+                                color="#64748B",
+                                font_size="1rem",
+                            ),
+                            align="start",
+                            gap="0.25rem",
+                        ),
+                        align="center",
+                        gap="1.25rem",
+                        width="100%",
+                        justify="start",
+                    ),
+                    type="button",
+                    on_click=AuthState.start_cashier_sale,
+                    auto_focus=True,
+                    disabled=AuthState.cashier_navigation_started,
+                    width="min(100%, 42.2rem)",
+                    min_height="6.8rem",
+                    box_sizing="border-box",
+                    padding="1.35rem clamp(1.5rem, 3.5vw, 2.75rem)",
+                    background="white",
+                    border="1px solid rgba(255, 255, 255, 0.8)",
+                    border_radius="1rem",
+                    box_shadow="0 12px 30px rgba(16, 45, 93, 0.17)",
+                    cursor="pointer",
+                    transition="transform 160ms ease, box-shadow 160ms ease",
+                    _hover={
+                        "transform": "translateY(-2px)",
+                        "box_shadow": "0 18px 42px rgba(16, 45, 93, 0.28)",
+                    },
+                    _focus_visible={
+                        "outline": "3px solid rgba(255, 255, 255, 0.95)",
+                        "outline_offset": "4px",
+                    },
+                    _active={"transform": "translateY(0)"},
+                ),
+                rx.cond(
+                    AuthState.cashier_feedback != "",
+                    rx.text(
+                        AuthState.cashier_feedback,
+                        role="status",
+                        color="white",
+                        text_align="center",
+                    ),
+                    rx.fragment(),
+                ),
+                class_name="cashier-welcome-action-area",
+            ),
+            align="center",
+            gap="0",
+            class_name="cashier-welcome-main",
+        ),
+        rx.hstack(
+            cashier_welcome_feature("shopping-cart", "Caixa", "Vendas e recebimentos"),
+            cashier_welcome_feature("credit-card", "Rápido e Seguro", "Mais praticidade no seu dia"),
+            cashier_welcome_feature("shield-check", "BIPSYSTEM", "Sempre com você", last=True),
+            width="min(100%, 54rem)",
+            align="center",
+            justify="center",
+            class_name="cashier-welcome-footer",
+        ),
+        width="100%",
+        height="100dvh",
+        min_height="100dvh",
+        padding="clamp(1.25rem, 3.2vh, 2rem) clamp(1rem, 4vw, 4rem)",
+        box_sizing="border-box",
+        display="flex",
+        flex_direction="column",
+        justify_content="flex-start",
+        gap="clamp(0.75rem, 2vh, 1.5rem)",
+        position="relative",
+        overflow_x="hidden",
+        overflow_y="hidden",
+        isolation="isolate",
+        background="linear-gradient(135deg, #2872D8 0%, #307CE8 48%, #2467C7 100%)",
+        class_name="cashier-welcome-page",
     )
 
 
@@ -1846,7 +3135,7 @@ def registration_form_panel() -> rx.Component:
         rx.vstack(
             rx.heading(
                 rx.cond(
-                    AuthState.employee_editing_id > 0,
+                    AuthState.employee_editing_id != "",
                     "Editar Funcionário",
                     "Adicionar Funcionário",
                 ),
@@ -1880,7 +3169,7 @@ def registration_form_panel() -> rx.Component:
                     type="password",
                     name="password",
                     placeholder=rx.cond(
-                        AuthState.employee_editing_id > 0,
+                        AuthState.employee_editing_id != "",
                         "Nova senha (opcional)",
                         "Digite a senha desejada",
                     ),
@@ -1903,7 +3192,7 @@ def registration_form_panel() -> rx.Component:
                 ),
                 rx.button(
                     rx.cond(
-                        AuthState.employee_editing_id > 0,
+                        AuthState.employee_editing_id != "",
                         "Salvar alterações",
                         "Cadastrar Funcionário",
                     ),
@@ -1947,7 +3236,7 @@ def registration_form_panel() -> rx.Component:
                 reset_on_submit=False,
             ),
             rx.cond(
-                AuthState.employee_editing_id > 0,
+                AuthState.employee_editing_id != "",
                 rx.button(
                     "Cancelar edição",
                     type="button",
@@ -2511,7 +3800,7 @@ def inventory_panel() -> rx.Component:
                 background="transparent",
                 color="#000000",
                 font_size="0.95rem",
-                _placeholder={"color": "#000000", "opacity": "1"},
+                _placeholder={"color": "#5B6475", "opacity": "1"},
                 _focus={
                     "border": "none",
                     "outline": "none",
@@ -2519,21 +3808,22 @@ def inventory_panel() -> rx.Component:
                 },
             ),
             width="100%",
-            height="3.25rem",
+            height="3.1rem",
             padding="0 1rem",
             gap="0.7rem",
             display="flex",
             flex_direction="row",
             align_items="center",
-            background="white",
+            background="#F7F9FC",
             border="1px solid #E5E7EB",
-            border_radius="0.75rem",
-            box_shadow="0 5px 18px rgba(23, 32, 51, 0.05)",
+            border_radius="0.7rem",
+            box_shadow="none",
             transition="border-color 160ms ease, box-shadow 160ms ease",
             _focus_within={
                 "border_color": "#93C5FD",
-                "box_shadow": "0 0 0 3px rgba(147, 197, 253, 0.28)",
+                "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2)",
             },
+            class_name="inventory-search-shell",
         ),
         rx.box(
             rx.foreach(AuthState.filtered_inventory, inventory_card),
@@ -2562,7 +3852,21 @@ def dashboard_layout(
     active_destination: str = "home",
     subtitle: str = "Aqui está um resumo do seu mercado hoje.",
     fixed_sidebar: bool = False,
+    scroll_content: bool = False,
 ) -> rx.Component:
+    content_area = (
+        rx.box(
+            content,
+            width="100%",
+            flex="1",
+            min_height="0",
+            overflow_y="auto",
+            overflow_x="hidden",
+            class_name="prices-content-scroll" if scroll_content else None,
+        )
+        if scroll_content
+        else content
+    )
     return rx.hstack(
         sidebar(
             active_destination=active_destination,
@@ -2571,13 +3875,16 @@ def dashboard_layout(
         rx.box(
             rx.vstack(
                 dashboard_header(subtitle=subtitle),
-                content,
+                content_area,
                 width="100%",
                 max_width="70rem",
                 margin="0 auto",
                 padding="clamp(2rem, 6vh, 4.5rem) clamp(1.25rem, 5vw, 5rem) 6rem",
                 gap="clamp(3rem, 8vh, 5.5rem)",
                 align="stretch",
+                height="100%" if scroll_content else None,
+                min_height="0" if scroll_content else None,
+                box_sizing="border-box" if scroll_content else None,
             ),
             rx.image(
                 src="/logo_bipsystem.png",
@@ -2591,10 +3898,13 @@ def dashboard_layout(
             position="relative",
             flex="1",
             min_width="0",
+            height="100dvh" if scroll_content else "auto",
             min_height="100dvh",
-            overflow="auto",
+            overflow="hidden" if scroll_content else "auto",
             background="#F7F9FC",
             margin_left="16rem" if fixed_sidebar else "0",
+            class_name="prices-dashboard-main" if scroll_content else None,
+            box_sizing="border-box" if scroll_content else None,
         ),
         width="100%",
         min_height="100dvh",
@@ -2605,7 +3915,7 @@ def dashboard_layout(
     )
 
 
-@rx.page(route="/", on_load=AuthState.require_auth)
+@rx.page(route="/", on_load=AuthState.require_admin)
 def dashboard() -> rx.Component:
     return dashboard_layout(
         dashboard_cards(),
@@ -2624,7 +3934,7 @@ def registration_page() -> rx.Component:
     )
 
 
-@rx.page(route="/estoque", on_load=AuthState.require_admin_and_load_inventory)
+@rx.page(route="/estoque", on_load=AuthState.require_operational_access_and_load_inventory)
 def estoque_page() -> rx.Component:
     return dashboard_layout(
         inventory_panel(),
@@ -2633,7 +3943,7 @@ def estoque_page() -> rx.Component:
     )
 
 
-@rx.page(route="/conferencia", on_load=AuthState.require_admin)
+@rx.page(route="/conferencia", on_load=AuthState.require_operational_access)
 def conferencia_page() -> rx.Component:
     return dashboard_layout(
         conference_form_panel(),
@@ -2642,7 +3952,7 @@ def conferencia_page() -> rx.Component:
     )
 
 
-@rx.page(route="/produtos", on_load=AuthState.require_admin)
+@rx.page(route="/produtos", on_load=AuthState.require_operational_access)
 def produtos_page() -> rx.Component:
     return dashboard_layout(
         product_form_panel(),
@@ -2660,18 +3970,25 @@ def relatorios_page() -> rx.Component:
     )
 
 
-@rx.page(route="/precos", on_load=AuthState.require_admin)
+@rx.page(route="/precos", on_load=PricesState.load_prices)
 def precos_page() -> rx.Component:
     return dashboard_layout(
         prices_panel(),
         active_destination="prices",
         subtitle="Aqui você pode cadastrar e consultar preços dos produtos",
+        fixed_sidebar=True,
+        scroll_content=True,
     )
 
 
-@rx.page(route="/caixa", on_load=AuthState.require_auth)
+@rx.page(route="/caixa", on_load=AuthState.require_cashier_page)
 def caixa_page() -> rx.Component:
     return cashier_page_content()
+
+
+@rx.page(route="/caixa-inicio", on_load=AuthState.require_cashier_welcome)
+def cashier_welcome_page() -> rx.Component:
+    return cashier_welcome_page_content()
 
 
 app = rx.App(
@@ -2707,6 +4024,130 @@ app = rx.App(
             "color": "#000000 !important",
             "opacity": "1 !important",
         },
+        ".cashier-entry-input, .cashier-entry-input:hover, .cashier-entry-input:focus, .cashier-entry-input:focus-visible, .cashier-entry-input:active, .cashier-entry-input input, .cashier-entry-input input:hover, .cashier-entry-input input:focus, .cashier-entry-input input:focus-visible, .cashier-entry-input input:active": {
+            "background": "#F7F9FC !important",
+            "color": "#000000 !important",
+            "-webkit-text-fill-color": "#000000 !important",
+            "caret-color": "#000000 !important",
+            "border-color": "#E5E7EB",
+        },
+        ".cashier-entry-input:focus, .cashier-entry-input:focus-visible, .cashier-entry-input input:focus, .cashier-entry-input input:focus-visible": {
+            "border-color": "#93C5FD !important",
+            "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2) !important",
+        },
+        ".cashier-entry-input::placeholder, .cashier-entry-input:hover::placeholder, .cashier-entry-input:focus::placeholder, .cashier-entry-input:focus-visible::placeholder, .cashier-entry-input:active::placeholder, .cashier-entry-input input::placeholder, .cashier-entry-input input:hover::placeholder, .cashier-entry-input input:focus::placeholder, .cashier-entry-input input:focus-visible::placeholder, .cashier-entry-input input:active::placeholder": {
+            "color": "#000000 !important",
+            "opacity": "1 !important",
+        },
+        ".cashier-page-header": {
+            "padding_bottom": "1.25rem",
+            "border_bottom": "1px solid rgba(255, 255, 255, 0.2)",
+        },
+        ".cashier-back-link": {
+            "position": "absolute",
+            "top": "clamp(1.25rem, 3vh, 2.5rem)",
+            "left": "clamp(1rem, 4vw, 4rem)",
+            "width": "2.75rem",
+            "height": "2.75rem",
+            "display": "flex",
+            "align_items": "center",
+            "justify_content": "center",
+            "border": "1px solid rgba(255, 255, 255, 0.4)",
+            "border_radius": "0.75rem",
+            "color": "white",
+            "text_decoration": "none",
+            "transition": "background 160ms ease, transform 160ms ease",
+            "z_index": "2",
+        },
+        ".cashier-back-link:hover": {
+            "background": "rgba(255, 255, 255, 0.14)",
+            "transform": "translateX(-2px)",
+        },
+        ".cashier-back-link:focus-visible": {
+            "outline": "3px solid white",
+            "outline_offset": "3px",
+        },
+        ".cashier-page-clock": {
+            "flex_shrink": "0",
+        },
+        ".cashier-total-card": {
+            "min_height": "8.5rem",
+            "display": "flex",
+            "align_items": "center",
+        },
+        ".cashier-products-card": {
+            "gap": "1.2rem",
+        },
+        ".cashier-entry-fields": {
+            "width": "100%",
+            "align_items": "center",
+        },
+        ".cashier-purchase-actions button": {
+            "min_height": "2.9rem",
+            "padding": "0.7rem 1.15rem",
+            "border_radius": "0.7rem",
+            "font_weight": "700",
+            "transition": "transform 160ms ease, box_shadow 160ms ease",
+        },
+        ".cashier-purchase-actions button:hover": {
+            "transform": "translateY(-1px)",
+            "box_shadow": "0 8px 18px rgba(23, 32, 51, 0.12)",
+        },
+        ".rt-DialogOverlay": {
+            "background": "rgba(20, 48, 92, 0.68) !important",
+            "backdrop_filter": "blur(4px)",
+        },
+        ".cashier-payment-dialog": {
+            "width": "min(44rem, calc(100vw - 2rem))",
+            "max_width": "44rem",
+            "max_height": "calc(100dvh - 2rem)",
+            "overflow_y": "auto",
+            "padding": "clamp(1.25rem, 4vw, 2rem)",
+            "background": "#FFFFFF !important",
+            "color": "#172B4D",
+            "border": "1px solid #E8EDF4",
+            "border_radius": "1rem",
+            "box_shadow": "0 24px 70px rgba(10, 25, 55, 0.28)",
+            "z_index": "1001",
+        },
+        ".rt-DialogContent.cashier-payment-dialog": {
+            "background_color": "#FFFFFF !important",
+            "color": "#172B4D !important",
+        },
+        ".cashier-payment-header": {
+            "margin_bottom": "0.15rem",
+        },
+        ".cashier-payment-close": {
+            "width": "2.75rem",
+            "height": "2.75rem",
+            "min_width": "2.75rem",
+            "margin_left": "auto",
+            "border_radius": "0.65rem",
+        },
+        ".cashier-payment-close:focus-visible": {
+            "outline": "3px solid #93C5FD",
+            "outline_offset": "2px",
+        },
+        ".cashier-payment-option:hover": {
+            "border_color": "#8BB8F8 !important",
+            "background": "#F7FAFF !important",
+        },
+        ".cashier-payment-option:focus-visible": {
+            "outline": "3px solid rgba(48, 124, 232, 0.45)",
+            "outline_offset": "2px",
+            "border_color": "#307CE8 !important",
+        },
+        ".cashier-payment-option.is-selected": {
+            "border_color": "#307CE8 !important",
+            "background": "#EFF6FF !important",
+            "box_shadow": "0 0 0 2px rgba(48, 124, 232, 0.14)",
+        },
+        ".cashier-payment-option.is-selected:hover": {
+            "background": "#EAF3FF !important",
+        },
+        ".cashier-items-table": {
+            "background": "white",
+        },
         ".registration-form-input input": {
             "color": "#000000 !important",
         },
@@ -2727,6 +4168,57 @@ app = rx.App(
             "color": "#5B6475 !important",
             "opacity": "1 !important",
         },
+        ".prices-dashboard-main .prices-input, .prices-dashboard-main .prices-input:hover, .prices-dashboard-main .prices-input:focus-within, .prices-dashboard-main .prices-input:active": {
+            "background": "#D9D9D9 !important",
+            "color": "#000000 !important",
+        },
+        ".prices-dashboard-main .prices-input input, .prices-dashboard-main .prices-input input:hover, .prices-dashboard-main .prices-input input:focus, .prices-dashboard-main .prices-input input:focus-visible, .prices-dashboard-main .prices-input input:active": {
+            "background": "#D9D9D9 !important",
+            "color": "#000000 !important",
+        },
+        ".prices-dashboard-main .prices-input input::placeholder": {
+            "color": "#000000 !important",
+            "opacity": "1 !important",
+        },
+        ".prices-dashboard-main .prices-search-input, .prices-dashboard-main .prices-search-input:hover, .prices-dashboard-main .prices-search-input:focus-within": {
+            "background": "#F7F9FC !important",
+            "border": "1px solid #E5E7EB !important",
+        },
+        ".prices-dashboard-main .prices-search-input:focus-within": {
+            "border": "1px solid #E5E7EB !important",
+            "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2) !important",
+        },
+        ".prices-dashboard-main .prices-search-input input, .prices-dashboard-main .prices-search-input input:focus": {
+            "background": "#F7F9FC !important",
+            "color": "#000000 !important",
+        },
+        ".prices-dashboard-main .prices-search-input::placeholder, .prices-dashboard-main .prices-search-input input::placeholder": {
+            "color": "#5B6475 !important",
+            "opacity": "1 !important",
+        },
+        ".inventory-search-shell, .inventory-search-shell:hover, .inventory-search-shell:focus-within": {
+            "background": "#F7F9FC !important",
+            "border": "1px solid #E5E7EB !important",
+        },
+        ".inventory-search-shell:focus-within": {
+            "border": "1px solid #E5E7EB !important",
+            "box_shadow": "0 0 0 2px rgba(59, 130, 246, 0.2) !important",
+        },
+        ".inventory-search-shell input, .inventory-search-shell input:focus": {
+            "background": "transparent !important",
+            "color": "#000000 !important",
+        },
+        ".inventory-search-shell input::placeholder": {
+            "color": "#5B6475 !important",
+            "opacity": "1 !important",
+        },
+        ".prices-content-scroll, .prices-table-scroll": {
+            "scrollbar_width": "none",
+            "-ms-overflow-style": "none",
+        },
+        ".prices-content-scroll::-webkit-scrollbar, .prices-table-scroll::-webkit-scrollbar": {
+            "display": "none",
+        },
         ".registration-employee-scroll": {
             "scrollbar_width": "none",
             "-ms-overflow-style": "none",
@@ -2739,6 +4231,99 @@ app = rx.App(
         },
         ".inventory-product-scroll::-webkit-scrollbar": {
             "display": "none",
+        },
+        ".cashier-welcome-main": {
+            "flex": "1",
+            "min_height": "0",
+            "width": "100%",
+            "justify_content": "flex-start",
+            "align_items": "stretch",
+            "padding": "0.5rem 0 clamp(1.5rem, 4vh, 2.5rem)",
+            "box_sizing": "border-box",
+            "position": "relative",
+            "z_index": "1",
+        },
+        ".cashier-welcome-top-space, .cashier-welcome-action-area": {
+            "flex": "1 1 0",
+            "min_height": "0",
+            "width": "100%",
+        },
+        ".cashier-welcome-action-area": {
+            "display": "flex",
+            "align_items": "center",
+            "justify_content": "center",
+            "transform": "translateY(calc((clamp(1.5rem, 4vh, 2.5rem) + clamp(0.75rem, 2vh, 1.5rem)) / 2))",
+        },
+        ".cashier-welcome-copy": {
+            "flex": "0 0 auto",
+        },
+        ".cashier-welcome-header": {
+            "flex": "0 0 auto",
+            "position": "relative",
+            "z_index": "1",
+        },
+        ".cashier-welcome-identity": {
+            "max_width": "min(70%, 30rem)",
+        },
+        ".cashier-welcome-clock": {
+            "flex_shrink": "0",
+            "align_self": "flex-start",
+            "text_align": "center",
+        },
+        ".cashier-welcome-date": {
+            "text_align": "center",
+        },
+        ".cashier-welcome-brand": {
+            "transform": "translateY(-80px)",
+            "margin_bottom": "0",
+        },
+        ".cashier-welcome-feature": {
+            "box_sizing": "border-box",
+        },
+        ".cashier-welcome-footer": {
+            "border": "1px solid rgba(255, 255, 255, 0.28)",
+            "border_radius": "0.85rem",
+            "background": "rgba(255, 255, 255, 0.08)",
+            "backdrop_filter": "blur(8px)",
+            "min_height": "5.5rem",
+            "align_self": "center",
+            "flex": "0 0 auto",
+            "position": "relative",
+            "z_index": "1",
+        },
+        ".cashier-welcome-orb": {
+            "position": "absolute",
+            "border_radius": "50%",
+            "pointer_events": "none",
+            "z_index": "0",
+        },
+        ".cashier-welcome-orb-one": {
+            "width": "clamp(22rem, 40vw, 38rem)",
+            "height": "clamp(22rem, 40vw, 38rem)",
+            "top": "-17rem",
+            "left": "-13rem",
+            "background": "rgba(151, 199, 255, 0.18)",
+        },
+        ".cashier-welcome-orb-two": {
+            "width": "clamp(26rem, 48vw, 46rem)",
+            "height": "clamp(26rem, 48vw, 46rem)",
+            "right": "-16rem",
+            "bottom": "-23rem",
+            "background": "rgba(15, 63, 139, 0.27)",
+        },
+        ".cashier-welcome-orb-three": {
+            "width": "clamp(10rem, 16vw, 15rem)",
+            "height": "clamp(10rem, 16vw, 15rem)",
+            "top": "38%",
+            "left": "7%",
+            "background": "rgba(120, 184, 255, 0.15)",
+        },
+        ".cashier-welcome-orb-four": {
+            "width": "clamp(12rem, 23vw, 21rem)",
+            "height": "clamp(12rem, 23vw, 21rem)",
+            "top": "10%",
+            "right": "11%",
+            "background": "rgba(255, 255, 255, 0.075)",
         },
         ".rt-TextFieldRoot:focus-within": {
             "outline": "none !important",
@@ -2798,19 +4383,13 @@ app = rx.App(
             },
         },
         "@media (max-width: 639px)": {
-            ".prices-search-row": {
-                "flex_direction": "column",
-                "align_items": "stretch",
-            },
-            ".prices-search-row button": {
-                "width": "100%",
-            },
-        },
-        "@media (max-width: 639px)": {
             ".dashboard-sidebar": {
                 "width": "5.5rem",
                 "min_width": "5.5rem",
                 "padding": "1rem 0.35rem",
+            },
+            ".prices-dashboard-main": {
+                "margin_left": "5.5rem !important",
             },
             ".dashboard-sidebar img": {
                 "width": "4.5rem",
@@ -2825,7 +4404,79 @@ app = rx.App(
                 "white_space": "normal",
             },
         },
+        "@media (min-width: 761px) and (max-width: 960px)": {
+            ".cashier-welcome-header": {
+                "flex_direction": "row",
+                "align_items": "flex-start",
+                "gap": "0.5rem",
+            },
+            ".cashier-welcome-identity": {
+                "max_width": "60%",
+                "justify_content": "flex-start",
+            },
+            ".cashier-welcome-clock": {
+                "align_self": "flex-start",
+            },
+            ".cashier-welcome-time": {
+                "font_size": "2rem",
+            },
+            ".cashier-welcome-date": {
+                "font_size": "0.85rem",
+            },
+        },
+        "@media (min-width: 761px) and (max-height: 700px)": {
+            ".cashier-welcome-page": {
+                "height": "auto",
+                "min_height": "100dvh",
+                "overflow_y": "auto",
+            },
+        },
         "@media (max-width: 760px)": {
+            ".cashier-welcome-page": {
+                "height": "auto",
+                "min_height": "100dvh",
+                "overflow_y": "auto",
+                "gap": "1rem",
+            },
+            ".cashier-welcome-header": {
+                "flex_direction": "column",
+                "align_items": "stretch",
+                "gap": "0.75rem",
+            },
+            ".cashier-welcome-identity, .cashier-welcome-clock": {
+                "justify_content": "center",
+                "max_width": "100%",
+            },
+            ".cashier-welcome-clock": {
+                "align_self": "center",
+                "margin_left": "0",
+            },
+            ".cashier-welcome-logout-divider": {
+                "display": "none",
+            },
+            ".cashier-welcome-main": {
+                "gap": "0",
+                "padding": "0.5rem 0",
+            },
+            ".cashier-welcome-action-area": {
+                "transform": "translateY(0.5rem)",
+            },
+            ".cashier-welcome-footer": {
+                "flex_direction": "column",
+                "align_items": "stretch",
+                "width": "100%",
+                "max_width": "34rem",
+                "padding": "0.25rem 0",
+            },
+            ".cashier-welcome-feature": {
+                "justify_content": "flex-start",
+                "border_right": "none",
+                "border_bottom": "1px solid rgba(255, 255, 255, 0.2)",
+                "width": "100%",
+            },
+            ".cashier-welcome-feature:last-child": {
+                "border_bottom": "none",
+            },
             ".cashier-shell": {
                 "flex_direction": "column",
             },
@@ -2834,11 +4485,77 @@ app = rx.App(
                 "min_width": "0",
             },
             ".cashier-brand": {
-                "min_height": "12rem",
-                "padding": "1.25rem",
+                "min_height": "auto",
+                "padding": "1rem 0.5rem",
             },
             ".cashier-workspace": {
                 "padding_top": "0",
+            },
+            ".cashier-brand img": {
+                "width": "min(8rem, 38vw)",
+            },
+            ".cashier-brand-content": {
+                "gap": "0.35rem",
+            },
+            ".cashier-page-header": {
+                "align_items": "center",
+                "padding_bottom": "0.85rem",
+            },
+            ".cashier-page-title": {
+                "font_size": "clamp(1.5rem, 7vw, 2.5rem)",
+            },
+            ".cashier-page-clock": {
+                "margin_left": "0",
+            },
+            ".cashier-entry-fields": {
+                "flex_direction": "row",
+                "flex_wrap": "wrap",
+            },
+            ".cashier-entry-fields input[name='barcode']": {
+                "flex_basis": "100%",
+            },
+            ".cashier-items-table": {
+                "overflow_x": "auto",
+            },
+            ".cashier-purchase-actions": {
+                "flex_wrap": "wrap",
+            },
+        },
+        "@media (max-width: 420px)": {
+            ".cashier-payment-header": {
+                "align_items": "flex-start",
+                "gap": "0.6rem",
+            },
+            ".cashier-payment-header > div:nth-child(2)": {
+                "display": "none",
+            },
+            ".cashier-payment-option": {
+                "padding": "0.85rem",
+            },
+            ".cashier-page-header": {
+                "gap": "0.5rem",
+            },
+            ".cashier-page-time": {
+                "font_size": "1.5rem",
+            },
+            ".cashier-page-date": {
+                "font_size": "0.72rem",
+            },
+            ".cashier-entry-heading": {
+                "align_items": "flex-start",
+                "flex_wrap": "wrap",
+            },
+            ".cashier-entry-heading button": {
+                "font_size": "0.78rem",
+                "padding": "0.45rem 0.6rem",
+            },
+            ".cashier-purchase-actions button": {
+                "flex": "1 1 100%",
+            },
+        },
+        "@media (max-width: 560px)": {
+            ".cashier-payment-grid": {
+                "grid_template_columns": "minmax(0, 1fr)",
             },
         },
         "img": {

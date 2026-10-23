@@ -23,13 +23,45 @@ function profile(
   };
 }
 
-Deno.test("manager can assign only operator accounts", () => {
-  const manager = profile("manager-id", "manager");
-  assertCanAssignRole(manager, "operator");
-  for (const role of ["manager", "owner"] as const) {
+Deno.test("manager and owner have identical role assignment permissions", () => {
+  const manager = profile("admin-id", parseRole("admin"));
+  const owner = profile("owner-id", parseRole("proprietario"));
+  for (const role of ["operator", "manager", "owner"] as const) {
+    assertCanAssignRole(manager, role);
+    assertCanAssignRole(owner, role);
+  }
+});
+
+Deno.test("business role aliases map to the existing enum values", () => {
+  const aliases = [
+    ["proprietario", "owner"],
+    ["admin", "manager"],
+    ["caixa", "operator"],
+  ] as const;
+  for (const [alias, expectedRole] of aliases) {
+    if (parseRole(alias) !== expectedRole) {
+      throw new Error(`Expected ${alias} to map to ${expectedRole}.`);
+    }
+  }
+});
+
+Deno.test("cashier cannot assign roles or manage employee accounts", () => {
+  const cashier = profile("cashier-id", parseRole("caixa"));
+  const target = profile("manager-id", "manager");
+  for (const role of ["operator", "manager", "owner"] as const) {
     try {
-      assertCanAssignRole(manager, role);
-      throw new Error("Expected elevated role assignment to be rejected.");
+      assertCanAssignRole(cashier, role);
+      throw new Error("Expected cashier role assignment to be rejected.");
+    } catch (error) {
+      if (!(error instanceof EmployeeRequestError) || error.status !== 403) {
+        throw error;
+      }
+    }
+  }
+  for (const operation of ["update", "delete"] as const) {
+    try {
+      assertCanManageEmployee(cashier, target, operation);
+      throw new Error(`Expected cashier ${operation} to be rejected.`);
     } catch (error) {
       if (!(error instanceof EmployeeRequestError) || error.status !== 403) {
         throw error;
@@ -38,36 +70,20 @@ Deno.test("manager can assign only operator accounts", () => {
   }
 });
 
-Deno.test("operators cannot assign employee roles", () => {
-  try {
-    assertCanAssignRole(profile("operator-id", "operator"), "operator");
-    throw new Error("Expected operator role assignment to be rejected.");
-  } catch (error) {
-    if (!(error instanceof EmployeeRequestError) || error.status !== 403) {
-      throw error;
-    }
-  }
-});
-
-Deno.test("owner can assign every supported role", () => {
-  const owner = profile("owner-id", "owner");
-  for (const role of ["operator", "manager", "owner"] as const) {
-    assertCanAssignRole(owner, role);
-  }
-});
-
-Deno.test("manager cannot edit an elevated account", () => {
-  try {
+Deno.test("manager and owner can manage the same target roles", () => {
+  const manager = profile("admin-id", parseRole("admin"));
+  const owner = profile("owner-id", parseRole("proprietario"));
+  for (const targetRole of ["operator", "manager", "owner"] as const) {
     assertCanManageEmployee(
-      profile("manager-id", "manager"),
-      profile("owner-id", "owner"),
+      manager,
+      profile(`target-${targetRole}`, targetRole),
       "update",
     );
-    throw new Error("Expected an elevated target to be rejected.");
-  } catch (error) {
-    if (!(error instanceof EmployeeRequestError) || error.status !== 403) {
-      throw error;
-    }
+    assertCanManageEmployee(
+      owner,
+      profile(`target-${targetRole}`, targetRole),
+      "update",
+    );
   }
 });
 

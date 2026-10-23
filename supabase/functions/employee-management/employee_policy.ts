@@ -3,6 +3,17 @@ export const SUPPORTED_ROLES = ["owner", "manager", "operator"] as const;
 export type EmployeeRole = (typeof SUPPORTED_ROLES)[number];
 export type EmployeeOperation = "update" | "delete";
 
+const ROLE_ALIASES: Record<string, EmployeeRole> = {
+  admin: "manager",
+  administrador: "manager",
+  caixa: "operator",
+  manager: "manager",
+  operator: "operator",
+  owner: "owner",
+  proprietario: "owner",
+  proprietário: "owner",
+};
+
 export interface EmployeeProfile {
   id: string;
   name: string;
@@ -39,13 +50,14 @@ export function isDuplicateEmailError(error: {
 }
 
 export function parseRole(value: unknown): EmployeeRole {
-  if (
-    typeof value !== "string" ||
-    !SUPPORTED_ROLES.includes(value as EmployeeRole)
-  ) {
+  if (typeof value !== "string") {
     throw new EmployeeRequestError(400, "O cargo informado é inválido.");
   }
-  return value as EmployeeRole;
+  const role = ROLE_ALIASES[value.trim().toLowerCase()];
+  if (!role) {
+    throw new EmployeeRequestError(400, "O cargo informado é inválido.");
+  }
+  return role;
 }
 
 export function normalizeEmployeeEmail(value: unknown): string {
@@ -87,12 +99,6 @@ export function assertCanAssignRole(
       "Você não pode gerenciar funcionários.",
     );
   }
-  if (actor.role === "manager" && role !== "operator") {
-    throw new EmployeeRequestError(
-      403,
-      "Gerentes podem gerenciar somente funcionários operadores.",
-    );
-  }
 }
 
 export function assertCanManageEmployee(
@@ -104,12 +110,6 @@ export function assertCanManageEmployee(
     throw new EmployeeRequestError(
       403,
       "Você não pode gerenciar funcionários.",
-    );
-  }
-  if (actor.role === "manager" && target.role !== "operator") {
-    throw new EmployeeRequestError(
-      403,
-      "Gerentes podem gerenciar somente funcionários operadores.",
     );
   }
   if (operation === "delete" && actor.id === target.id) {

@@ -5,7 +5,7 @@ Defines account authentication and session behavior using Supabase Auth while pr
 ## ADDED Requirements
 
 ### Requirement: Users authenticate with Supabase Auth
-The system SHALL authenticate users with Supabase Auth using their email and password and SHALL load their active profile and role before granting protected access. It SHALL preserve the existing post-login destinations: operators go to `/caixa`, and managers and owners go to `/`.
+The system SHALL authenticate users with Supabase Auth using their email and password and SHALL load their active profile and role before granting protected access. Operators SHALL go to `/caixa-inicio` before proceeding to the existing `/caixa` route; managers and owners SHALL continue to go to `/`.
 
 #### Scenario: Active user logs in
 - **WHEN** a user submits valid credentials and has an active profile with a supported role

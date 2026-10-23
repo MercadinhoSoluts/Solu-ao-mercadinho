@@ -24,7 +24,7 @@ The UI and event handlers are Python Reflex, not a handwritten browser applicati
 
 ### Keep employee Auth administration in one trusted Edge Function
 
-Supabase Auth users are the credential source of truth. Use an `auth.users` trigger to create and synchronize a `public.profiles` row. Use a narrowly scoped Edge Function for employee list/create/update/delete because Auth Admin operations require privileged credentials; it validates the caller's JWT, reads the caller's role from `profiles`, applies the owner/manager restrictions, then invokes Auth Admin. Never accept caller identity or role from a request body. Profile RLS remains enabled, and employee UI operations continue to display only safe account fields.
+Supabase Auth users are the credential source of truth. Use an `auth.users` trigger to create and synchronize a `public.profiles` row. Use a narrowly scoped Edge Function for employee list/create/update/delete because Auth Admin operations require privileged credentials; it validates the caller's JWT, reads the caller's role from `profiles`, applies identical owner/manager permissions, then invokes Auth Admin. Never accept caller identity or role from a request body. Profile RLS remains enabled, and employee UI operations continue to display only safe account fields.
 
 ### Model only entities backed by current workflows
 
@@ -48,11 +48,15 @@ Receiving and manager/owner corrections update `stock_lots.units` and append `in
 
 ### Apply the guide's operation matrix without inventing missing screens
 
-All authenticated roles can read active products and stock needed for existing workflows. Operators may create products and receive stock, and can use the product, conference, and stock routes needed for those tasks. Only managers and owners may correct stock. Employee directory/provisioning follows the explicit rule confirmed for this change: managers may manage operator accounts only; owners may assign any supported role. Prices remains restricted to owner/manager as it is today. Sales cancellation stays deferred with the rest of checkout because no sales UI or current sales API client exists.
+All authenticated roles can read active products and stock needed for existing workflows. Operators may create products and receive stock, and can use the product, conference, and stock routes needed for those tasks. Only managers and owners may correct stock. Managers and owners have identical employee directory/provisioning permissions and may assign any supported role; either role is prevented from deleting its own account. Prices remains restricted to manager/owner. Sales cancellation stays deferred with the rest of checkout because no sales UI or current sales API client exists.
 
-### Start Supabase empty and retain Xano as an unsynchronized archive
+### Preserve Xano and gate cutover on a validated data import
 
-Do not import or dual-write Xano users, products, stock, or prices. Provision the initial Supabase owner through a documented, one-time trusted bootstrap procedure, then require that owner to create active accounts through the employee workflow. Products and stock begin empty and must be re-entered by authorized users; prices are added only after their products exist. Keep Xano and its data unchanged for historical lookup, but do not describe it as a complete rollback target after new Supabase writes begin: reversing application configuration would omit those new writes. Do not present Xano records as if they were in Supabase or silently fall back to Xano. The user-selected empty-dataset decision removes the need for a historical export/import, while the existing schema mismatches remain documented for any future migration.
+The Xano `.xs` artifacts available in the repository describe table schemas only; no authenticated row export is available. Keep Xano data unchanged and mark data migration/cutover pending until a consistent export is obtained, validated, reconciled, imported, and checked against Supabase. The new offline validator checks the required `user`, `produtos`, `codigobarra`, `estoque`, and `preco` JSON exports, role mappings, product/barcode relationships, stock grouping, and exact price precision; it never connects to or writes to Supabase. Use the documented import order and verify the current linked-project baseline before any future import.
+
+Map Xano integer user IDs to newly created Supabase Auth UUIDs; passwords are not portable and require reset. Map `operator`/`caixa` to `operator`, `manager`/`admin` to `manager`, and `owner`/`proprietario` to `owner`. Map `produtos.nome`/`marca`/`peso` and the related barcode to `products`; map `estoque` to opening stock balances and price rows to immutable cent-valued price history. Multiple barcodes for one product, orphaned rows, and non-cent prices require resolution before import. Xano stock rows do not provide movement history, so past movements cannot be reconstructed. Preserve the Xano source and do not imply that new Supabase writes synchronize back to it; rollback after cutover is not lossless.
+
+For a fresh Supabase project, provision the first owner with a one-time, trusted SQL Editor operation after Auth creates the profile. Abort if any owner already exists. The linked project already has an active owner, so do not run that bootstrap there.
 
 ### Use the explicitly linked project for migration verification
 

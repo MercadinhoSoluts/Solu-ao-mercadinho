@@ -1,49 +1,80 @@
 from __future__ import annotations
 
+import logging
 import os
+import re
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from math import isfinite
+from time import time
 from typing import Any
+from urllib.parse import urlsplit
+from uuid import UUID
 
 import httpx
+from postgrest.exceptions import APIError
+from supabase_auth.errors import AuthApiError
+
+from bipsystem.supabase_client import (
+    SupabaseConfigurationError,
+    request_supabase_client,
+)
 
 
-DEFAULT_XANO_API_BASE_URL = "https://x8ki-letl-twmt.n7.xano.io/api:_832jVAW"
-XANO_API_BASE_URL = os.environ.get(
-    "XANO_API_BASE_URL",
-    DEFAULT_XANO_API_BASE_URL,
-).rstrip("/")
 SUPPORTED_ROLES = {"owner", "manager", "operator"}
+logger = logging.getLogger(__name__)
 ROLE_ALIASES = {
     "admin": "manager",
     "administrador": "manager",
+    "administradora": "manager",
+    "gerente": "manager",
+    "gestor": "manager",
+    "manager": "manager",
     "proprietario": "owner",
     "proprietário": "owner",
+    "proprietaria": "owner",
+    "dono": "owner",
+    "owner": "owner",
+    "caixa": "operator",
+    "cashier": "operator",
+    "operador": "operator",
+    "operadora": "operator",
+    "funcionario": "operator",
+    "funcionário": "operator",
+    "operator": "operator",
 }
 ROLE_LABELS = {
     "Proprietário": "owner",
     "Operador": "operator",
+    "Caixa": "operator",
     "Admin": "manager",
+    "Administrador": "manager",
 }
 
 
-class XanoApiError(Exception):
+class SupabaseApiError(Exception):
     def __init__(self, status_code: int, code: str = "", message: str = "") -> None:
-        super().__init__(message or "Xano API request failed.")
+        super().__init__(message or "Supabase request failed.")
         self.status_code = status_code
         self.code = code
-        self.message = message or "Xano API request failed."
+        self.message = message or "Supabase request failed."
 
 
 @dataclass(frozen=True)
 class AuthenticatedUser:
-    user_id: int
+    user_id: str
     name: str
     email: str
     role: str
-    is_active: bool | None = None
+    is_active: bool
+
+
+@dataclass(frozen=True)
+class AuthSession:
+    access_token: str
+    refresh_token: str
+    expires_at: int
 
 
 def parse_product_weight(value: str) -> int | float | None:
@@ -71,12 +102,10 @@ def normalize_role(value: str) -> str | None:
     role = value.strip()
     if role in ROLE_LABELS:
         return ROLE_LABELS[role]
-    alias = ROLE_ALIASES.get(role.casefold())
-    if alias is not None:
-        return alias
-    if role in SUPPORTED_ROLES:
-        return role
-    return None
+    normalized = ROLE_ALIASES.get(role.casefold())
+    if normalized is not None:
+        return normalized
+    return role if role in SUPPORTED_ROLES else None
 
 
 def validate_password(password: str) -> str | None:
@@ -93,97 +122,346 @@ def validate_password(password: str) -> str | None:
     return None
 
 
-def _decode_response(response: httpx.Response) -> dict[str, Any]:
+def _translate_error(
+    error: APIError | AuthApiError,
+    http_status: int | None = None,
+) -> SupabaseApiError:
+    error_code = str(getattr(error, "code", "") or "")
+    raw_status = getattr(error, "status", None)
+    if raw_status is None:
+        raw_status = getattr(error, "status_code", None)
+    if raw_status is None:
+        raw_status = http_status
     try:
-        payload = response.json()
-    except ValueError as error:
-        raise XanoApiError(
-            response.status_code,
-            message="O Xano retornou uma resposta inválida.",
-        ) from error
+        status = int(raw_status)
+    except (TypeError, ValueError):
+        status = 400 if isinstance(error, AuthApiError) else 500
 
-    if not isinstance(payload, dict):
-        raise XanoApiError(
-            response.status_code,
-            message="O Xano retornou uma resposta incompatível.",
-        )
-    return payload
+    if error_code in {"23505", "email_exists"}:
+        status = 409
+    elif error_code == "42501":
+        status = 403
+    elif error_code in {"PGRST301", "PGRST302", "PGRST303"}:
+        status = 401
+    elif error_code in {"P1003", "P1007", "P1010", "P1011"}:
+        status = 409
+    elif error_code in {"P1001", "P1002", "P1004"}:
+        status = 404
+    elif error_code in {"P1005", "P1006"}:
+        status = 400
+    elif error_code == "P1008":
+        status = 500
+    elif error_code.startswith(("22", "23")):
+        status = 400
 
-
-def _raise_for_api_error(response: httpx.Response) -> None:
-    if response.is_success:
-        return
-    payload = _decode_response(response)
-    raise XanoApiError(
-        response.status_code,
-        code=str(payload.get("code", "")),
-        message=str(payload.get("message", "")),
+    schema_errors = {
+        "PGRST202",
+        "PGRST204",
+        "PGRST205",
+        "42P01",
+        "42703",
+        "42883",
+        "42804",
+    }
+    purchase_messages = {
+        "P1001": "Este código de barras não pertence a um produto ativo.",
+        "P1002": "Este produto não possui um preço vigente.",
+        "P1003": "A compra não está aberta para alterações.",
+        "P1004": "A compra não foi encontrada.",
+        "P1005": "Adicione pelo menos um item antes de finalizar a compra.",
+        "P1006": "A quantidade deve ser um número inteiro maior que zero.",
+        "P1007": "Esta solicitação já foi usada com outros dados.",
+        "P1010": "Estoque insuficiente para concluir a venda. Verifique os saldos e tente novamente.",
+        "P1011": "A compra já foi finalizada com outro método de pagamento.",
+        "PGRST202": (
+            "O serviço de abertura de compras não está disponível no Supabase. "
+            "Verifique a implantação da migration."
+        ),
+        "PGRST204": (
+            "O schema do Supabase não corresponde à versão desta aplicação. "
+            "Contate o suporte."
+        ),
+        "PGRST205": (
+            "As tabelas de compras não estão disponíveis no Supabase. "
+            "Verifique a implantação da migration."
+        ),
+        "42P01": (
+            "A estrutura de compras não existe no Supabase. "
+            "Verifique a implantação da migration."
+        ),
+        "42703": (
+            "O schema do Supabase não corresponde à versão desta aplicação. "
+            "Contate o suporte."
+        ),
+        "42883": (
+            "A função de compras não está disponível no Supabase. "
+            "Verifique a implantação da migration."
+        ),
+        "42804": (
+            "Os dados enviados não correspondem aos tipos definidos no "
+            "Supabase. Contate o suporte."
+        ),
+    }
+    safe_messages = {
+        400: "Verifique os dados informados e tente novamente.",
+        401: "Sua sessão expirou ou não é mais válida. Entre novamente.",
+        403: "Você não tem autorização para realizar esta ação.",
+        409: "Já existe um registro com esses dados.",
+        404: "O recurso solicitado não foi encontrado no Supabase.",
+        500: "O Supabase encontrou um erro interno ao processar a operação.",
+    }
+    if error_code in schema_errors:
+        status = 503 if error_code.startswith("PGRST") else 500
+    return SupabaseApiError(
+        int(status),
+        error_code,
+        purchase_messages.get(
+            error_code,
+            safe_messages.get(int(status), "O Supabase não conseguiu concluir a operação."),
+        ),
     )
 
 
-def _parse_user(payload: dict[str, Any]) -> AuthenticatedUser:
-    try:
-        user_id = int(payload["id"])
-        name = str(payload["name"])
-        email = str(payload["email"])
-        role = str(payload["role"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise XanoApiError(
+def _redact_diagnostic(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(
+        r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", text)
+    text = re.sub(r"\bsb_(?:secret|publishable)_[A-Za-z0-9_-]+", "[REDACTED]", text)
+    text = re.sub(r"\beyJ[A-Za-z0-9_.-]{20,}", "[REDACTED]", text)
+    return text[:1000]
+
+
+def _session_from_response(response: Any) -> AuthSession:
+    session = getattr(response, "session", None)
+    access_token = getattr(session, "access_token", None)
+    refresh_token = getattr(session, "refresh_token", None)
+    expires_at = getattr(session, "expires_at", None)
+    if not isinstance(expires_at, int):
+        expires_in = getattr(session, "expires_in", None)
+        if isinstance(expires_in, int) and expires_in > 0:
+            expires_at = int(time()) + expires_in
+    if (
+        not isinstance(access_token, str)
+        or not access_token
+        or not isinstance(refresh_token, str)
+        or not refresh_token
+        or not isinstance(expires_at, int)
+    ):
+        raise SupabaseApiError(
             502,
-            message="O Xano retornou dados de usuário incompletos.",
+            "invalid_session",
+            "O Supabase retornou uma sessão incompatível.",
+        )
+    return AuthSession(access_token, refresh_token, expires_at)
+
+
+def _parse_profile(profile: Any) -> AuthenticatedUser:
+    if not isinstance(profile, dict):
+        raise SupabaseApiError(
+            403,
+            "profile_missing",
+            "Não foi encontrado um perfil válido para esta conta.",
+        )
+    try:
+        user_id = str(profile["id"])
+        name = str(profile["name"])
+        email = str(profile["email"])
+        raw_role = str(profile["role"])
+        is_active = profile["is_active"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise SupabaseApiError(
+            502,
+            "invalid_profile",
+            "O perfil retornado pelo Supabase é inválido.",
         ) from error
 
-    normalized_role = normalize_role(role)
-    if normalized_role is None:
-        raise XanoApiError(
-            502,
-            message="O Xano retornou uma função de usuário não reconhecida.",
+    role = normalize_role(raw_role)
+    if (
+        not user_id
+        or not name.strip()
+        or not email.strip()
+        or role is None
+        or not isinstance(is_active, bool)
+    ):
+        raise SupabaseApiError(
+            403,
+            "invalid_profile",
+            "A conta não possui um perfil ativo e válido.",
         )
-
-    is_active = payload.get("is_active")
-    if is_active is not None and not isinstance(is_active, bool):
-        raise XanoApiError(
-            502,
-            message="O Xano retornou um estado de usuário inválido.",
-        )
-
-    return AuthenticatedUser(user_id, name, email, normalized_role, is_active)
+    return AuthenticatedUser(user_id, name, email, role, is_active)
 
 
-async def login(email: str, password: str) -> tuple[str, int]:
+async def login(email: str, password: str) -> AuthSession:
+    normalized_email = email.strip().lower()
+    if not normalized_email or not password:
+        raise SupabaseApiError(400, "invalid_credentials", "Credenciais inválidas.")
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{XANO_API_BASE_URL}/auth/login",
-                json={"email": email, "password": password},
+        async with request_supabase_client() as client:
+            response = await client.auth.sign_in_with_password(
+                {"email": normalized_email, "password": password}
             )
+        return _session_from_response(response)
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
     except httpx.RequestError as error:
-        raise XanoApiError(0, message="Não foi possível conectar ao Xano.") from error
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível conectar ao Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
 
-    _raise_for_api_error(response)
-    payload = _decode_response(response)
-    token = payload.get("authToken")
-    user_id = payload.get("user_id")
-    if not isinstance(token, str) or not token or not isinstance(user_id, int):
-        raise XanoApiError(
-            502,
-            message="O Xano retornou uma resposta de login incompatível.",
-        )
-    return token, user_id
+
+async def refresh_session(refresh_token: str) -> AuthSession:
+    try:
+        async with request_supabase_client() as client:
+            response = await client.auth.refresh_session(refresh_token)
+        return _session_from_response(response)
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível renovar a sessão do Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
 
 
 async def get_current_user(token: str) -> AuthenticatedUser:
     try:
+        async with request_supabase_client(token) as client:
+            auth_response = await client.auth.get_user(token)
+            auth_user = getattr(auth_response, "user", None)
+            user_id = getattr(auth_user, "id", None)
+            if not isinstance(user_id, str) or not user_id:
+                raise SupabaseApiError(
+                    401,
+                    "invalid_session",
+                    "Sessão inválida ou expirada.",
+                )
+            profile_response = await (
+                client.table("profiles")
+                .select("id, name, email, role, is_active")
+                .eq("id", user_id)
+                .maybe_single()
+                .execute()
+            )
+        profile = _parse_profile(profile_response.data)
+        if profile.user_id != user_id:
+            raise SupabaseApiError(
+                403,
+                "invalid_profile",
+                "O perfil não corresponde à identidade autenticada.",
+            )
+        return profile
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível consultar o Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
+async def logout(token: str) -> None:
+    try:
+        url, anon_key = _supabase_configuration()
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{XANO_API_BASE_URL}/auth/me",
-                headers={"Authorization": f"Bearer {token}"},
+            response = await client.post(
+                f"{url}/auth/v1/logout",
+                headers={
+                    "apikey": anon_key,
+                    "Authorization": f"Bearer {token}",
+                },
+            )
+        if not response.is_success:
+            raise SupabaseApiError(
+                response.status_code,
+                "logout_failed",
+                "O Supabase não confirmou o encerramento da sessão.",
             )
     except httpx.RequestError as error:
-        raise XanoApiError(0, message="Não foi possível consultar o Xano.") from error
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível encerrar a sessão do Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
 
-    _raise_for_api_error(response)
-    return _parse_user(_decode_response(response))
+
+def _supabase_configuration() -> tuple[str, str]:
+    url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    anon_key = os.environ.get("SUPABASE_ANON_KEY", "").strip()
+    if not url or not anon_key:
+        raise SupabaseApiError(
+            500,
+            "configuration_error",
+            "Configure SUPABASE_URL e SUPABASE_ANON_KEY para usar o Supabase.",
+        )
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise SupabaseApiError(
+            500,
+            "configuration_error",
+            "SUPABASE_URL deve ser uma URL HTTP ou HTTPS válida.",
+        )
+    return url, anon_key
+
+
+async def _employee_action(token: str, payload: dict[str, Any]) -> dict[str, Any]:
+    url, anon_key = _supabase_configuration()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{url}/functions/v1/employee-management",
+                headers={
+                    "apikey": anon_key,
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível conectar ao serviço de funcionários.",
+        ) from error
+
+    try:
+        result = response.json()
+    except ValueError as error:
+        raise SupabaseApiError(
+            502,
+            "invalid_response",
+            "O serviço de funcionários retornou uma resposta inválida.",
+        ) from error
+    if not isinstance(result, dict):
+        raise SupabaseApiError(
+            502,
+            "invalid_response",
+            "O serviço de funcionários retornou uma resposta incompatível.",
+        )
+    if not response.is_success:
+        message = str(result.get("error", ""))
+        code = str(result.get("code", ""))
+        if response.status_code == 409 or "já está cadastrado" in message.lower():
+            raise SupabaseApiError(409, code or "duplicate_email", message)
+        raise SupabaseApiError(response.status_code, code, message)
+    return result
 
 
 async def create_employee(
@@ -193,96 +471,104 @@ async def create_employee(
     password: str,
     role: str,
 ) -> dict[str, Any]:
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{XANO_API_BASE_URL}/users",
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "name": name,
-                    "email": email,
-                    "password": password,
-                    "role": role,
-                },
-            )
-    except httpx.RequestError as error:
-        raise XanoApiError(0, message="Não foi possível cadastrar no Xano.") from error
-
-    _raise_for_api_error(response)
-    payload = _decode_response(response)
-    if not isinstance(payload.get("id"), int):
-        raise XanoApiError(
+    normalized_role = normalize_role(role)
+    if normalized_role is None:
+        raise SupabaseApiError(400, "invalid_role", "O cargo informado é inválido.")
+    result = await _employee_action(
+        token,
+        {
+            "action": "create",
+            "name": name,
+            "email": email,
+            "password": password,
+            "role": normalized_role,
+        },
+    )
+    employee = result.get("employee")
+    if not isinstance(employee, dict) or not isinstance(employee.get("id"), str):
+        raise SupabaseApiError(
             502,
-            message="O Xano retornou uma resposta de cadastro incompatível.",
+            "invalid_response",
+            "O Supabase não confirmou o cadastro do funcionário.",
         )
-    return payload
+    return employee
 
 
 async def list_employees(token: str) -> list[dict[str, Any]]:
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{XANO_API_BASE_URL}/users",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-    except httpx.RequestError as error:
-        raise XanoApiError(0, message="Não foi possível consultar os funcionários.") from error
-
-    _raise_for_api_error(response)
-    payload = response.json()
-    if not isinstance(payload, list) or not all(
-        isinstance(record, dict) for record in payload
+    result = await _employee_action(token, {"action": "list"})
+    employees = result.get("employees")
+    if not isinstance(employees, list) or not all(
+        isinstance(employee, dict) for employee in employees
     ):
-        raise XanoApiError(
+        raise SupabaseApiError(
             502,
-            message="O Xano retornou uma lista de funcionários inválida.",
+            "invalid_response",
+            "O Supabase retornou uma lista de funcionários inválida.",
         )
-    return payload
+    return employees
 
 
 async def update_employee(
     token: str,
-    employee_id: int,
+    employee_id: str,
     name: str,
     email: str,
     role: str,
     password: str = "",
 ) -> dict[str, Any]:
-    payload: dict[str, str] = {"name": name, "email": email, "role": role}
+    normalized_role = normalize_role(role)
+    if normalized_role is None:
+        raise SupabaseApiError(400, "invalid_role", "O cargo informado é inválido.")
+    payload: dict[str, Any] = {
+        "action": "update",
+        "userId": employee_id,
+        "name": name,
+        "email": email,
+        "role": normalized_role,
+    }
     if password:
         payload["password"] = password
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.patch(
-                f"{XANO_API_BASE_URL}/users/{employee_id}",
-                headers={"Authorization": f"Bearer {token}"},
-                json=payload,
-            )
-    except httpx.RequestError as error:
-        raise XanoApiError(0, message="Não foi possível atualizar o funcionário.") from error
-
-    _raise_for_api_error(response)
-    result = _decode_response(response)
-    if result.get("id") != employee_id:
-        raise XanoApiError(
+    result = await _employee_action(token, payload)
+    employee = result.get("employee")
+    if not isinstance(employee, dict) or employee.get("id") != employee_id:
+        raise SupabaseApiError(
             502,
-            message="O Xano não confirmou a atualização do funcionário.",
+            "invalid_response",
+            "O Supabase não confirmou a atualização do funcionário.",
         )
-    return result
+    return employee
 
 
-async def delete_employee(token: str, employee_id: int) -> None:
+async def delete_employee(token: str, employee_id: str) -> None:
+    result = await _employee_action(
+        token,
+        {"action": "delete", "userId": employee_id},
+    )
+    if result.get("deleted") is not True or result.get("userId") != employee_id:
+        raise SupabaseApiError(
+            502,
+            "invalid_response",
+            "O Supabase não confirmou a exclusão do funcionário.",
+        )
+
+
+def _product_from_row(row: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        raise SupabaseApiError(502, "invalid_response", "Produto inválido no Supabase.")
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.delete(
-                f"{XANO_API_BASE_URL}/users/{employee_id}",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-    except httpx.RequestError as error:
-        raise XanoApiError(0, message="Não foi possível excluir o funcionário.") from error
-
-    _raise_for_api_error(response)
+        return {
+            "id": str(row["id"]),
+            "tipo": str(row["product_type"]),
+            "marca": str(row["brand"]),
+            "peso": float(row["weight_grams"]),
+            "codigo_de_barra": str(row["barcode"]),
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        raise SupabaseApiError(
+            502,
+            "invalid_response",
+            "O Supabase retornou dados de produto incompletos.",
+        ) from error
 
 
 async def create_product(
@@ -292,51 +578,603 @@ async def create_product(
     peso: int | float,
     codigo_de_barra: str,
 ) -> dict[str, Any]:
-    payload = {
-        "tipo": tipo,
-        "marca": marca,
-        "peso": peso,
-        "codigo_de_barra": codigo_de_barra,
-    }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{XANO_API_BASE_URL}/produtos",
-                headers={"Authorization": f"Bearer {token}"},
-                json=payload,
+        async with request_supabase_client(token) as client:
+            auth_response = await client.auth.get_user(token)
+            user = getattr(auth_response, "user", None)
+            user_id = getattr(user, "id", None)
+            if not isinstance(user_id, str) or not user_id:
+                raise SupabaseApiError(401, "invalid_session", "Sessão inválida.")
+            response = await (
+                client.table("products")
+                .insert(
+                    {
+                        "product_type": tipo.strip(),
+                        "brand": marca.strip(),
+                        "weight_grams": peso,
+                        "barcode": codigo_de_barra.strip(),
+                        "created_by": user_id,
+                    }
+                )
+                .select("id, product_type, brand, weight_grams, barcode")
+                .single()
+                .execute()
             )
+        product = _product_from_row(response.data)
+        if (
+            product["tipo"] != tipo.strip()
+            or product["marca"] != marca.strip()
+            or product["codigo_de_barra"] != codigo_de_barra.strip()
+            or Decimal(str(product["peso"])) != Decimal(str(peso))
+        ):
+            raise SupabaseApiError(
+                502,
+                "invalid_response",
+                "O Supabase retornou um produto diferente dos dados enviados.",
+            )
+        return product
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
     except httpx.RequestError as error:
-        raise XanoApiError(0, message="Não foi possível conectar ao Xano.") from error
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível conectar ao Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
 
-    _raise_for_api_error(response)
-    result = _decode_response(response)
-    if not isinstance(result.get("id"), int):
-        raise XanoApiError(
+
+async def list_products(token: str) -> list[dict[str, Any]]:
+    try:
+        async with request_supabase_client(token) as client:
+            response = await (
+                client.table("products")
+                .select("id, product_type, brand, weight_grams, barcode")
+                .eq("is_active", True)
+                .order("product_type")
+                .execute()
+            )
+        rows = response.data
+        if not isinstance(rows, list):
+            raise SupabaseApiError(
+                502,
+                "invalid_response",
+                "O Supabase retornou uma lista de produtos inválida.",
+            )
+        return [_product_from_row(row) for row in rows]
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível consultar os produtos no Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
+async def list_inventory(token: str) -> list[dict[str, Any]]:
+    try:
+        async with request_supabase_client(token) as client:
+            response = await (
+                client.table("stock_lots")
+                .select("id, product_id, batch_label, units, expires_on")
+                .order("expires_on")
+                .execute()
+            )
+        rows = response.data
+        if not isinstance(rows, list):
+            raise SupabaseApiError(
+                502,
+                "invalid_response",
+                "O Supabase retornou uma lista de estoque inválida.",
+            )
+        return [
+            {
+                "id": str(row["id"]),
+                "produtos_id": str(row["product_id"]),
+                "lote": str(row["batch_label"]),
+                "unidades": int(row["units"]),
+                "validade": str(row["expires_on"]),
+            }
+            for row in rows
+        ]
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
+    except (KeyError, TypeError, ValueError) as error:
+        raise SupabaseApiError(
             502,
-            message="O Xano não confirmou o cadastro do produto.",
+            "invalid_response",
+            "O Supabase retornou dados de estoque inválidos.",
+        ) from error
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível consultar o estoque no Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
+async def get_available_stock(
+    token: str,
+    product_id: str,
+    business_date: str,
+) -> int:
+    try:
+        normalized_product_id = str(UUID(product_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(
+            400,
+            "invalid_product_id",
+            "O produto informado é inválido.",
+        ) from error
+    if parse_inventory_date(business_date) is None:
+        raise SupabaseApiError(
+            400,
+            "invalid_business_date",
+            "A data para consulta do estoque é inválida.",
         )
-    if (
-        result.get("tipo") != tipo
-        or result.get("marca") != marca
-        or result.get("codigo_de_barra") != codigo_de_barra
-    ):
-        raise XanoApiError(
+
+    try:
+        async with request_supabase_client(token) as client:
+            response = await (
+                client.table("stock_lots")
+                .select("units")
+                .eq("product_id", normalized_product_id)
+                .gte("expires_on", business_date)
+                .execute()
+            )
+        rows = response.data
+        if not isinstance(rows, list):
+            raise SupabaseApiError(
+                502,
+                "invalid_response",
+                "O Supabase retornou um saldo de estoque inválido.",
+            )
+        units = [row["units"] for row in rows]
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in units
+        ):
+            raise ValueError("Invalid stock lot units")
+        return sum(units)
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
+    except (KeyError, TypeError, ValueError) as error:
+        raise SupabaseApiError(
             502,
-            message="O Xano retornou um produto diferente dos dados enviados.",
+            "invalid_response",
+            "O Supabase retornou dados de estoque inválidos.",
+        ) from error
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível consultar o estoque no Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
+async def create_inventory_lot(
+    token: str,
+    produtos_id: str,
+    unidades: int,
+    validade: str,
+    lote: str,
+) -> dict[str, Any]:
+    try:
+        async with request_supabase_client(token) as client:
+            response = await client.rpc(
+                "receive_stock",
+                {
+                    "p_product_id": produtos_id,
+                    "p_batch_label": lote,
+                    "p_units": unidades,
+                    "p_expires_on": validade,
+                },
+            ).execute()
+        row = response.data
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+            raise SupabaseApiError(
+                502,
+                "invalid_response",
+                "O Supabase não confirmou a atualização do estoque.",
+            )
+        return {
+            "id": row["id"],
+            "produtos_id": str(row["product_id"]),
+            "lote": str(row["batch_label"]),
+            "unidades": int(row["units"]),
+            "validade": str(row["expires_on"]),
+        }
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
+    except (KeyError, TypeError, ValueError) as error:
+        raise SupabaseApiError(
+            502,
+            "invalid_response",
+            "O Supabase retornou dados de estoque inválidos.",
+        ) from error
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível atualizar o estoque no Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
+async def find_product_by_barcode(
+    token: str,
+    barcode: str,
+) -> dict[str, Any] | None:
+    try:
+        async with request_supabase_client(token) as client:
+            response = await (
+                client.table("products")
+                .select("id, product_type, brand, weight_grams, barcode")
+                .eq("barcode", barcode.strip())
+                .eq("is_active", True)
+                .maybe_single()
+                .execute()
+            )
+        return _product_from_row(response.data) if response.data is not None else None
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível consultar o produto no Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
+async def create_product_price(
+    token: str,
+    product_id: str,
+    price_cents: int,
+) -> dict[str, Any]:
+    try:
+        async with request_supabase_client(token) as client:
+            auth_response = await client.auth.get_user(token)
+            user = getattr(auth_response, "user", None)
+            user_id = getattr(user, "id", None)
+            if not isinstance(user_id, str) or not user_id:
+                raise SupabaseApiError(401, "invalid_session", "Sessão inválida.")
+            response = await (
+                client.table("product_price_history")
+                .insert(
+                    {
+                        "product_id": product_id,
+                        "price_cents": price_cents,
+                        "created_by": user_id,
+                    }
+                )
+                .select("id, product_id, price_cents, created_at")
+                .single()
+                .execute()
+            )
+        if not isinstance(response.data, dict):
+            raise SupabaseApiError(
+                502,
+                "invalid_response",
+                "O Supabase não confirmou o cadastro do preço.",
+            )
+        return response.data
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível registrar o preço no Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
+async def list_current_prices(token: str) -> list[dict[str, Any]]:
+    try:
+        async with request_supabase_client(token) as client:
+            response = await (
+                client.table("current_product_prices")
+                .select(
+                    "product_id, product_name, barcode, product_type, brand, "
+                    "weight_grams, price_cents, price_created_at"
+                )
+                .order("product_name")
+                .execute()
+            )
+        rows = response.data
+        if not isinstance(rows, list):
+            raise SupabaseApiError(
+                502,
+                "invalid_response",
+                "O Supabase retornou uma lista de preços inválida.",
+            )
+        return rows
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível consultar os preços no Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
+def _purchase_from_rpc(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise SupabaseApiError(
+            502,
+            "invalid_response",
+            "O Supabase retornou uma compra inválida.",
         )
     try:
-        returned_weight = Decimal(str(result["peso"]))
-    except (KeyError, InvalidOperation, TypeError, ValueError) as error:
-        raise XanoApiError(
+        purchase_id = str(UUID(str(value["id"])))
+        status = value["status"]
+        total_cents = value["total_cents"]
+        payment_method = value.get("payment_method")
+        raw_items = value["items"]
+        if (
+            not isinstance(status, str)
+            or status not in {"open", "completed", "cancelled"}
+            or (
+                payment_method is not None
+                and (
+                    not isinstance(payment_method, str)
+                    or payment_method
+                    not in {"credit_card", "debit_card", "pix", "cash"}
+                )
+            )
+            or isinstance(total_cents, bool)
+            or not isinstance(total_cents, int)
+            or total_cents < 0
+            or not isinstance(raw_items, list)
+        ):
+            raise ValueError("Invalid purchase fields")
+
+        items = []
+        for row in raw_items:
+            if not isinstance(row, dict):
+                raise ValueError("Invalid purchase item")
+            quantity = row["quantity"]
+            unit_price_cents = row["unit_price_cents"]
+            line_total_cents = row["line_total_cents"]
+            if (
+                isinstance(quantity, bool)
+                or not isinstance(quantity, int)
+                or quantity <= 0
+                or isinstance(unit_price_cents, bool)
+                or not isinstance(unit_price_cents, int)
+                or unit_price_cents <= 0
+                or isinstance(line_total_cents, bool)
+                or not isinstance(line_total_cents, int)
+                or line_total_cents != quantity * unit_price_cents
+            ):
+                raise ValueError("Invalid purchase item totals")
+            item_id = str(UUID(str(row["id"])))
+            product_name = row["product_name"]
+            barcode = row["barcode"]
+            if (
+                not isinstance(product_name, str)
+                or not isinstance(barcode, str)
+                or not product_name.strip()
+                or not barcode.strip()
+            ):
+                raise ValueError("Invalid purchase item description")
+            items.append(
+                {
+                    "id": item_id,
+                    "product_name": product_name,
+                    "barcode": barcode,
+                    "quantity": quantity,
+                    "unit_price_cents": unit_price_cents,
+                    "line_total_cents": line_total_cents,
+                }
+            )
+        if sum(item["line_total_cents"] for item in items) != total_cents:
+            raise ValueError("Purchase total does not match its items")
+    except (KeyError, TypeError, ValueError) as error:
+        raise SupabaseApiError(
             502,
-            message="O Xano retornou um peso inválido para o produto.",
+            "invalid_response",
+            "O Supabase retornou dados de compra incompletos ou inconsistentes.",
         ) from error
-    if returned_weight != Decimal(str(peso)):
-        raise XanoApiError(
-            502,
-            message="O Xano retornou um peso diferente do informado.",
+
+    return {
+        "id": purchase_id,
+        "status": status,
+        "total_cents": total_cents,
+        "payment_method": payment_method,
+        "items": items,
+    }
+
+
+async def _cashier_purchase_rpc(
+    token: str,
+    function_name: str,
+    parameters: dict[str, Any],
+) -> dict[str, Any]:
+    http_status: int | None = None
+
+    def observe_response(response: httpx.Response) -> None:
+        nonlocal http_status
+        http_status = response.status_code
+
+    try:
+        async with request_supabase_client(
+            token,
+            response_observer=observe_response,
+        ) as client:
+            response = await client.rpc(function_name, parameters).execute()
+        return _purchase_from_rpc(response.data)
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        translated = _translate_error(error, http_status=http_status)
+        logger.error(
+            "Cashier Supabase RPC failed: function=%s http_status=%s "
+            "code=%s message=%s details=%s hint=%s",
+            function_name,
+            http_status
+            or getattr(error, "status", None)
+            or getattr(error, "status_code", None)
+            or "unavailable",
+            _redact_diagnostic(getattr(error, "code", "")),
+            _redact_diagnostic(getattr(error, "message", str(error))),
+            _redact_diagnostic(getattr(error, "details", "")),
+            _redact_diagnostic(getattr(error, "hint", "")),
         )
-    return result
+        raise translated from error
+    except httpx.RequestError as error:
+        logger.error(
+            "Cashier Supabase RPC connection failed: function=%s error_type=%s",
+            function_name,
+            type(error).__name__,
+        )
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível conectar ao Supabase para atualizar a compra.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        logger.error(
+            "Cashier Supabase RPC configuration failed: function=%s error=%s",
+            function_name,
+            _redact_diagnostic(error),
+        )
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
+async def open_cashier_purchase(token: str, request_id: str) -> dict[str, Any]:
+    try:
+        normalized_request_id = str(UUID(request_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(400, "invalid_request_id", "Solicitação inválida.") from error
+    return await _cashier_purchase_rpc(
+        token,
+        "open_cashier_purchase",
+        {"p_open_request_id": normalized_request_id},
+    )
+
+
+async def get_cashier_purchase(token: str, purchase_id: str) -> dict[str, Any]:
+    try:
+        normalized_purchase_id = str(UUID(purchase_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(400, "invalid_purchase_id", "Compra inválida.") from error
+    return await _cashier_purchase_rpc(
+        token,
+        "get_cashier_purchase",
+        {"p_purchase_id": normalized_purchase_id},
+    )
+
+
+async def add_cashier_purchase_item(
+    token: str,
+    purchase_id: str,
+    barcode: str,
+    quantity: int,
+    request_id: str,
+) -> dict[str, Any]:
+    try:
+        normalized_purchase_id = str(UUID(purchase_id))
+        normalized_request_id = str(UUID(request_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(400, "invalid_request_id", "Solicitação inválida.") from error
+    if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
+        raise SupabaseApiError(
+            400,
+            "invalid_quantity",
+            "A quantidade deve ser um número inteiro maior que zero.",
+        )
+    if not isinstance(barcode, str):
+        raise SupabaseApiError(400, "invalid_barcode", "Informe o código de barras.")
+    normalized_barcode = barcode.strip()
+    if not normalized_barcode:
+        raise SupabaseApiError(400, "invalid_barcode", "Informe o código de barras.")
+    return await _cashier_purchase_rpc(
+        token,
+        "add_cashier_purchase_item",
+        {
+            "p_purchase_id": normalized_purchase_id,
+            "p_barcode": normalized_barcode,
+            "p_quantity": quantity,
+            "p_request_id": normalized_request_id,
+        },
+    )
+
+
+async def complete_cashier_purchase(
+    token: str,
+    purchase_id: str,
+    payment_method: str,
+) -> dict[str, Any]:
+    try:
+        normalized_purchase_id = str(UUID(purchase_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(400, "invalid_purchase_id", "Compra inválida.") from error
+    if (
+        not isinstance(payment_method, str)
+        or payment_method not in {"credit_card", "debit_card", "pix", "cash"}
+    ):
+        raise SupabaseApiError(
+            400,
+            "invalid_payment_method",
+            "Selecione um método de pagamento válido.",
+        )
+    return await _cashier_purchase_rpc(
+        token,
+        "complete_cashier_purchase",
+        {
+            "p_purchase_id": normalized_purchase_id,
+            "p_payment_method": payment_method,
+        },
+    )
+
+
+async def cancel_cashier_purchase(
+    token: str,
+    purchase_id: str,
+) -> dict[str, Any]:
+    try:
+        normalized_purchase_id = str(UUID(purchase_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SupabaseApiError(400, "invalid_purchase_id", "Compra inválida.") from error
+    return await _cashier_purchase_rpc(
+        token,
+        "cancel_cashier_purchase",
+        {"p_purchase_id": normalized_purchase_id},
+    )
 
 
 def parse_inventory_units(value: str) -> int | None:
@@ -354,91 +1192,14 @@ def parse_inventory_date(value: str) -> str | None:
         return None
 
 
-async def list_products(token: str) -> list[dict[str, Any]]:
-    return await _list_xano_records(token, "/produtos")
-
-
-async def list_inventory(token: str) -> list[dict[str, Any]]:
-    return await _list_xano_records(token, "/estoque")
-
-
-async def _list_xano_records(token: str, path: str) -> list[dict[str, Any]]:
+def validate_price_cents(value: str) -> int | None:
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{XANO_API_BASE_URL}{path}",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-    except httpx.RequestError as error:
-        raise XanoApiError(0, message="Não foi possível conectar ao Xano.") from error
-
-    _raise_for_api_error(response)
-    payload = response.json()
-    if not isinstance(payload, list) or not all(
-        isinstance(record, dict) for record in payload
-    ):
-        raise XanoApiError(
-            502,
-            message="O Xano retornou uma lista inválida.",
-        )
-    return payload
-
-
-async def create_inventory_lot(
-    token: str,
-    produtos_id: int,
-    unidades: int,
-    validade: str,
-    lote: str,
-) -> dict[str, Any]:
-    return await _mutate_inventory(
-        token,
-        "post",
-        "/estoque",
-        {
-            "produtos_id": produtos_id,
-            "unidades": unidades,
-            "validade": validade,
-            "lote": lote,
-        },
-    )
-
-
-async def update_inventory_lot(
-    token: str,
-    estoque_id: int,
-    unidades: int,
-) -> dict[str, Any]:
-    return await _mutate_inventory(
-        token,
-        "patch",
-        f"/estoque/{estoque_id}",
-        {"unidades": unidades},
-    )
-
-
-async def _mutate_inventory(
-    token: str,
-    method: str,
-    path: str,
-    payload: dict[str, Any],
-) -> dict[str, Any]:
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            request = getattr(client, method)
-            response = await request(
-                f"{XANO_API_BASE_URL}{path}",
-                headers={"Authorization": f"Bearer {token}"},
-                json=payload,
-            )
-    except httpx.RequestError as error:
-        raise XanoApiError(0, message="Não foi possível conectar ao Xano.") from error
-
-    _raise_for_api_error(response)
-    result = _decode_response(response)
-    if not isinstance(result.get("id"), int):
-        raise XanoApiError(
-            502,
-            message="O Xano não confirmou a atualização do estoque.",
-        )
-    return result
+        price = Decimal(value.strip().replace(",", "."))
+    except (InvalidOperation, AttributeError):
+        return None
+    if not price.is_finite() or price <= 0:
+        return None
+    cents = price * 100
+    if cents != cents.to_integral_value():
+        return None
+    return int(cents)

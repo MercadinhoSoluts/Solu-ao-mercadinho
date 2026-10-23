@@ -42,15 +42,15 @@ The system SHALL relate authenticated profiles to Supabase Auth users, stock lot
 - **THEN** the database rejects the duplicate and the application presents a safe validation message
 
 ### Requirement: Role authorization is enforced by the database and trusted operations
-The system SHALL derive role decisions from the authenticated user's profile, never from a role supplied by the browser. RLS and any trusted Auth administration operation SHALL enforce the approved role matrix: operators may create products and receive stock; managers and owners may perform stock corrections; only owners may assign any role; managers may manage operator accounts only. No role SHALL gain permissions solely because a control is hidden in the UI.
+The system SHALL derive role decisions from the authenticated user's profile, never from a role supplied by the browser. RLS and any trusted Auth administration operation SHALL enforce the approved role matrix: operators may create products and receive stock; managers and owners may perform stock corrections; managers and owners have identical employee-management permissions and may assign any supported role. No role SHALL gain permissions solely because a control is hidden in the UI.
 
 #### Scenario: Operator attempts a manager-only stock correction
 - **WHEN** an authenticated operator attempts to perform a stock correction
 - **THEN** Supabase rejects the operation and leaves stock unchanged
 
-#### Scenario: Manager attempts to assign an elevated role
-- **WHEN** a manager attempts to create or change a profile to manager or owner
-- **THEN** the trusted employee-management operation rejects the request and creates no account
+#### Scenario: Manager assigns an elevated role
+- **WHEN** a manager creates or changes a profile to manager or owner
+- **THEN** the trusted employee-management operation applies the requested role under the same rules used for an owner
 
 #### Scenario: Browser supplies a forged role
 - **WHEN** a request claims a role different from the authenticated user's stored profile

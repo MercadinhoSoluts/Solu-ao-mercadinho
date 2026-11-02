@@ -3,12 +3,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
 import reflex as rx
+from plotly.graph_objs import Figure
 
 from bipsystem.auth_client import (
     AuthSession,
@@ -28,6 +29,7 @@ from bipsystem.auth_client import (
     list_employees,
     list_inventory,
     list_current_prices,
+    list_completed_sales,
     list_products,
     is_valid_product_text,
     login,
@@ -191,6 +193,9 @@ class AuthState(rx.State):
         self._refresh_token = ""
         self._token_expires_at = 0.0
         self._clear_cashier_purchase()
+
+    def clear_login_feedback(self, _: str) -> None:
+        self.login_feedback = ""
 
     def _clear_cashier_purchase(self) -> None:
         self.cashier_purchase_id = ""
@@ -1094,6 +1099,7 @@ def field(
             type=input_type,
             placeholder=placeholder,
             aria_label=placeholder,
+            on_change=AuthState.clear_login_feedback,
             variant="soft",
             color="white",
             background="transparent",
@@ -1241,7 +1247,7 @@ def login_page() -> rx.Component:
                 ),
                 rx.form(
                     rx.vstack(
-                        field("user-round", "Usuário", "user"),
+                        field("user-round", "E-mail", "user", "email"),
                         field("lock-keyhole", "Senha", "senha", "password"),
                         rx.button(
                             "Login",
@@ -1384,26 +1390,30 @@ REPORT_CARDS = (
     {
         "title": "Data próxima",
         "description": "Produtos com data de validade próxima",
-        "icon": "calendar-clock",
-        "color": "#FF0004",
+        "icon": "calendar",
+        "color": "#EF4444",
+        "href": "/data-proxima",
     },
     {
         "title": "Estoque baixo",
         "description": "Produtos que estão com estoque baixo",
-        "icon": "package-x",
-        "color": "#FF0004",
+        "icon": "package",
+        "color": "#EF4444",
+        "href": "/estoque-baixo",
     },
     {
         "title": "Vendas semanais",
         "description": "Relatório de vendas semanais",
         "icon": "trending-up",
-        "color": "#77FF80",
+        "color": "#22C55E",
+        "href": "/relatorios/vendas-semanais",
     },
     {
         "title": "Vendas diárias",
         "description": "Relatório de vendas diárias",
         "icon": "trending-up",
-        "color": "#77FF80",
+        "color": "#22C55E",
+        "href": "/relatorios/vendas-diarias",
     },
 )
 
@@ -1649,6 +1659,379 @@ def dashboard_cards() -> rx.Component:
         width="100%",
         align="center",
     )
+
+
+def report_dashboard_card(card: dict[str, str]) -> rx.Component:
+    return rx.link(
+        rx.card(
+            rx.vstack(
+                rx.box(
+                    rx.icon(card["icon"], size=26, color="white", stroke_width=2),
+                    display="flex",
+                    align_items="center",
+                    justify_content="center",
+                    width="3.5rem",
+                    height="3.5rem",
+                    border_radius="50%",
+                    background=card["color"],
+                ),
+                rx.heading(
+                    card["title"],
+                    size="4",
+                    color="#172033",
+                    text_align="center",
+                ),
+                rx.text(
+                    card["description"],
+                    color="#7A8496",
+                    font_size="0.91rem",
+                    line_height="1.45",
+                    text_align="center",
+                ),
+                align="center",
+                justify="center",
+                gap="0.85rem",
+                width="100%",
+                min_height="12rem",
+            ),
+            width="100%",
+            height="100%",
+            padding="1.5rem 1.15rem",
+            background="white",
+            border_radius="0.7rem",
+            box_shadow="0 5px 18px rgba(23, 32, 51, 0.08)",
+            transition="transform 160ms ease, box-shadow 160ms ease",
+            _hover={
+                "transform": "translateY(-4px)",
+                "box_shadow": "0 9px 24px rgba(23, 32, 51, 0.14)",
+            },
+        ),
+        href=card["href"],
+        width="100%",
+        display="block",
+        text_decoration="none",
+        _focus_visible={"outline": "3px solid #93C5FD", "outline_offset": "3px"},
+    )
+
+
+class SalesDashboardState(rx.State):
+    period: str = "daily"
+    chart_labels: list[str] = []
+    chart_values: list[float] = []
+    chart_data: dict[str, Any] = {
+        "data": [
+            {
+                "type": "bar",
+                "x": [],
+                "y": [],
+                "marker": {"color": "#22C55E"},
+                "hovertemplate": "R$ %{y:.2f}<extra></extra>",
+            }
+        ]
+    }
+    feedback: str = ""
+
+    @staticmethod
+    def _chart_values(
+        rows: list[dict[str, Any]],
+        period: str,
+        now: datetime,
+    ) -> tuple[list[str], list[float]]:
+        local_now = now.astimezone(timezone(timedelta(hours=-3)))
+        today = local_now.date()
+        if period == "daily":
+            labels = [f"{hour:02d}h" for hour in range(24)]
+            totals = {label: 0 for label in labels}
+            for row in rows:
+                try:
+                    timestamp = datetime.fromisoformat(
+                        str(row["created_at"]).replace("Z", "+00:00")
+                    )
+                    amount = row["total_cents"]
+                    if (
+                        isinstance(amount, bool)
+                        or not isinstance(amount, int)
+                        or amount < 0
+                    ):
+                        raise ValueError("Invalid sale amount")
+                except (KeyError, TypeError, ValueError) as error:
+                    raise SupabaseApiError(
+                        502,
+                        "invalid_response",
+                        "O Supabase retornou dados de venda inválidos.",
+                    ) from error
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                local_timestamp = timestamp.astimezone(local_now.tzinfo)
+                if local_timestamp.date() == today:
+                    key = f"{local_timestamp.hour:02d}h"
+                    totals[key] += amount
+            return labels, [totals[label] / 100 for label in labels]
+
+        if period != "weekly":
+            raise ValueError("Unsupported sales chart period")
+        first_day = today - timedelta(days=6)
+        days = [first_day + timedelta(days=offset) for offset in range(7)]
+        labels = [day.strftime("%d/%m") for day in days]
+        totals = {day: 0 for day in days}
+        for row in rows:
+            try:
+                timestamp = datetime.fromisoformat(
+                    str(row["created_at"]).replace("Z", "+00:00")
+                )
+                amount = row["total_cents"]
+                if (
+                    isinstance(amount, bool)
+                    or not isinstance(amount, int)
+                    or amount < 0
+                ):
+                    raise ValueError("Invalid sale amount")
+            except (KeyError, TypeError, ValueError) as error:
+                raise SupabaseApiError(
+                    502,
+                    "invalid_response",
+                    "O Supabase retornou dados de venda inválidos.",
+                ) from error
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            local_date = timestamp.astimezone(local_now.tzinfo).date()
+            if local_date in totals:
+                totals[local_date] += amount
+        return labels, [totals[day] / 100 for day in days]
+
+    async def _load_sales(self, period: str) -> Any:
+        auth_state = await self.get_state(AuthState)
+        redirect = await auth_state.require_admin()
+        if redirect is not None:
+            return redirect
+        if not auth_state._auth_token:
+            return rx.redirect("/login")
+
+        local_now = datetime.now(timezone(timedelta(hours=-3)))
+        first_day = (
+            local_now.date()
+            if period == "daily"
+            else local_now.date() - timedelta(days=6)
+        )
+        start_at = datetime.combine(
+            first_day, datetime.min.time(), tzinfo=local_now.tzinfo
+        )
+        end_at = (
+            start_at + timedelta(days=1)
+            if period == "daily"
+            else datetime.combine(
+                local_now.date() + timedelta(days=1),
+                datetime.min.time(),
+                tzinfo=local_now.tzinfo,
+            )
+        )
+        self.period = period
+        try:
+            rows = await list_completed_sales(
+                auth_state._auth_token,
+                start_at.astimezone(timezone.utc).isoformat(),
+                end_at.astimezone(timezone.utc).isoformat(),
+            )
+            self.chart_labels, self.chart_values = self._chart_values(
+                rows, period, local_now
+            )
+            self.chart_data = {
+                "data": [
+                    {
+                        "type": "bar",
+                        "x": self.chart_labels,
+                        "y": self.chart_values,
+                        "marker": {"color": "#22C55E"},
+                        "hovertemplate": "R$ %{y:.2f}<extra></extra>",
+                    }
+                ]
+            }
+            self.feedback = ""
+        except SupabaseApiError as error:
+            self.chart_labels = []
+            self.chart_values = []
+            self.chart_data = {"data": []}
+            self.feedback = error.message
+
+    async def load_daily_sales(self) -> Any:
+        return await self._load_sales("daily")
+
+    async def load_weekly_sales(self) -> Any:
+        return await self._load_sales("weekly")
+
+
+class EstoqueState(rx.State):
+    figura_grafico: dict[str, Any] = {
+        "data": [{"type": "bar", "x": [], "y": [], "marker": {"color": "#EF4444"}}]
+    }
+    feedback: str = ""
+
+    @staticmethod
+    def _build_figure(
+        inventory: list[dict[str, Any]],
+        products: list[dict[str, Any]],
+        today: date,
+        minimum_units: int = 10,
+    ) -> dict[str, Any]:
+        products_by_id = {
+            str(product["id"]): product
+            for product in products
+            if product.get("id")
+        }
+        quantities = {product_id: 0 for product_id in products_by_id}
+        for lot in inventory:
+            product_id = str(lot["produtos_id"])
+            if product_id not in quantities:
+                continue
+            try:
+                expires_on = date.fromisoformat(str(lot["validade"]))
+                units = int(lot["unidades"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise SupabaseApiError(
+                    502,
+                    "invalid_response",
+                    "O Supabase retornou dados de estoque inválidos.",
+                ) from error
+            if units < 0:
+                raise SupabaseApiError(
+                    502,
+                    "invalid_response",
+                    "O Supabase retornou uma quantidade de estoque inválida.",
+                )
+            if expires_on >= today:
+                quantities[product_id] += units
+
+        low_stock = [
+            (AuthState._inventory_product_name(products_by_id[product_id]), units)
+            for product_id, units in quantities.items()
+            if units <= minimum_units
+        ]
+        low_stock.sort(key=lambda product: (product[1], product[0].casefold()))
+        return {
+            "data": [
+                {
+                    "type": "bar",
+                    "x": [product[0] for product in low_stock],
+                    "y": [product[1] for product in low_stock],
+                    "marker": {"color": "#EF4444"},
+                    "hovertemplate": "%{x}<br>Quantidade: %{y}<extra></extra>",
+                }
+            ]
+        }
+
+    async def buscar_estoque_baixo(self) -> Any:
+        auth_state = await self.get_state(AuthState)
+        redirect = await auth_state.require_admin()
+        if redirect is not None:
+            return redirect
+        if not auth_state._auth_token:
+            return rx.redirect("/login")
+        try:
+            products = await list_products(auth_state._auth_token)
+            inventory = await list_inventory(auth_state._auth_token)
+            self.figura_grafico = self._build_figure(
+                inventory,
+                products,
+                datetime.now(timezone(timedelta(hours=-3))).date(),
+            )
+            self.feedback = ""
+        except SupabaseApiError as error:
+            self.figura_grafico = {"data": []}
+            self.feedback = error.message
+
+
+class ValidadeState(rx.State):
+    figura_grafico: dict[str, Any] = {
+        "data": [
+            {
+                "type": "bar",
+                "orientation": "h",
+                "x": [],
+                "y": [],
+                "marker": {"color": "#EF4444"},
+            }
+        ]
+    }
+    feedback: str = ""
+
+    @staticmethod
+    def _build_figure(
+        inventory: list[dict[str, Any]],
+        products: list[dict[str, Any]],
+        today: date,
+        days_ahead: int = 15,
+    ) -> dict[str, Any]:
+        products_by_id = {
+            str(product["id"]): product
+            for product in products
+            if product.get("id")
+        }
+        expiring_lots: list[tuple[datetime.date, str, int, str]] = []
+        last_day = today + timedelta(days=days_ahead)
+        for lot in inventory:
+            try:
+                product_id = str(lot["produtos_id"])
+                expires_on = date.fromisoformat(str(lot["validade"]))
+                units = int(lot["unidades"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise SupabaseApiError(
+                    502,
+                    "invalid_response",
+                    "O Supabase retornou dados de validade inválidos.",
+                ) from error
+            if (
+                product_id not in products_by_id
+                or units <= 0
+                or not today <= expires_on <= last_day
+            ):
+                continue
+            product_name = AuthState._inventory_product_name(
+                products_by_id[product_id]
+            )
+            expiring_lots.append(
+                (expires_on, product_name, units, str(lot.get("lote", "")))
+            )
+        expiring_lots.sort(key=lambda lot: (lot[0], lot[1].casefold(), lot[3]))
+        labels = [
+            f"{name} — lote {batch}" if batch else name
+            for _, name, _, batch in expiring_lots
+        ]
+        return {
+            "data": [
+                {
+                    "type": "bar",
+                    "orientation": "h",
+                    "x": [(expires_on - today).days for expires_on, *_ in expiring_lots],
+                    "y": labels,
+                    "customdata": [units for _, _, units, _ in expiring_lots],
+                    "marker": {"color": "#EF4444"},
+                    "hovertemplate": (
+                        "%{y}<br>Dias até o vencimento: %{x}"
+                        "<br>Unidades: %{customdata}<extra></extra>"
+                    ),
+                }
+            ]
+        }
+
+    async def buscar_validade_proxima(self) -> Any:
+        auth_state = await self.get_state(AuthState)
+        redirect = await auth_state.require_admin()
+        if redirect is not None:
+            return redirect
+        if not auth_state._auth_token:
+            return rx.redirect("/login")
+        try:
+            products = await list_products(auth_state._auth_token)
+            inventory = await list_inventory(auth_state._auth_token)
+            self.figura_grafico = self._build_figure(
+                inventory,
+                products,
+                datetime.now(timezone(timedelta(hours=-3))).date(),
+            )
+            self.feedback = ""
+        except SupabaseApiError as error:
+            self.figura_grafico = {"data": []}
+            self.feedback = error.message
 
 
 class PricesState(rx.State):
@@ -2108,13 +2491,139 @@ def prices_panel() -> rx.Component:
 
 def reports_cards() -> rx.Component:
     return rx.box(
-        *[dashboard_card(card) for card in REPORT_CARDS],
+        *[report_dashboard_card(card) for card in REPORT_CARDS],
         width="100%",
         max_width="62rem",
         display="grid",
         grid_template_columns="1fr",
         class_name="dashboard-card-grid dashboard-card-grid-reports",
         gap="2.5rem",
+    )
+
+
+def dashboard_home_button() -> rx.Component:
+    return rx.link(
+        rx.button(
+            rx.icon("arrow-left", size=18),
+            "Voltar para o início",
+            variant="soft",
+            color="#172033",
+            background="white",
+            border="1px solid #E5E7EB",
+            _hover={"background": "#F7F9FC"},
+        ),
+        href="/",
+        text_decoration="none",
+        align_self="start",
+    )
+
+
+def sales_dashboard_page(title: str) -> rx.Component:
+    return rx.vstack(
+        dashboard_home_button(),
+        rx.card(
+            rx.vstack(
+                rx.heading(title, size="5", color="#172033"),
+                rx.cond(
+                    SalesDashboardState.feedback != "",
+                    rx.text(
+                        SalesDashboardState.feedback,
+                        color="#B42318",
+                        role="alert",
+                    ),
+                    rx.plotly(
+                        data=SalesDashboardState.chart_data.to(Figure),
+                        layout={
+                            "autosize": True,
+                            "height": 420,
+                            "margin": {"l": 60, "r": 24, "t": 24, "b": 60},
+                            "paper_bgcolor": "white",
+                            "plot_bgcolor": "white",
+                            "xaxis": {"title": "Hora" if title.endswith("diárias") else "Data"},
+                            "yaxis": {"title": "Vendas (R$)", "rangemode": "tozero"},
+                        },
+                        width="100%",
+                        height="26rem",
+                    ),
+                ),
+                width="100%",
+                align="stretch",
+                gap="1rem",
+            ),
+            width="100%",
+            max_width="62rem",
+            margin="0 auto",
+            padding="clamp(1.25rem, 2.5vw, 2rem)",
+            background="white",
+            border_radius="1rem",
+            box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
+        ),
+        width="100%",
+        max_width="62rem",
+        margin="0 auto",
+        align="stretch",
+        gap="1rem",
+    )
+
+
+def inventory_dashboard_page(
+    title: str,
+    subtitle: str,
+    figure_data: Any,
+    feedback: Any,
+    *,
+    horizontal: bool = False,
+) -> rx.Component:
+    return rx.vstack(
+        dashboard_home_button(),
+        rx.card(
+            rx.vstack(
+                rx.heading(title, size="5", color="#172033"),
+                rx.text(subtitle, color="#7A8496"),
+                rx.cond(
+                    feedback != "",
+                    rx.text(feedback, color="#B42318", role="alert"),
+                    rx.plotly(
+                        data=figure_data.to(Figure),
+                        layout={
+                            "autosize": True,
+                            "height": 480,
+                            "margin": {"l": 190 if horizontal else 50, "r": 30, "t": 24, "b": 70},
+                            "paper_bgcolor": "white",
+                            "plot_bgcolor": "white",
+                            "xaxis": {
+                                "title": (
+                                    "Dias até o vencimento"
+                                    if horizontal
+                                    else "Produto"
+                                ),
+                                "rangemode": "tozero",
+                            },
+                            "yaxis": {
+                                "title": "Produto" if horizontal else "Unidades disponíveis",
+                                "autorange": "reversed" if horizontal else True,
+                            },
+                        },
+                        width="100%",
+                        height="30rem",
+                    ),
+                ),
+                width="100%",
+                align="stretch",
+                gap="0.75rem",
+            ),
+            width="100%",
+            max_width="62rem",
+            padding="clamp(1.25rem, 2.5vw, 2rem)",
+            background="white",
+            border_radius="1rem",
+            box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
+        ),
+        width="100%",
+        max_width="62rem",
+        margin="0 auto",
+        align="stretch",
+        gap="1.25rem",
     )
 
 
@@ -3186,7 +3695,6 @@ def registration_form_panel() -> rx.Component:
                     aria_label="Digite a função do funcionário",
                     value=AuthState.employee_form_role,
                     on_change=AuthState.set_employee_form_role,
-                    class_name="registration-form-input",
                     justify_content="center",
                     **input_style,
                 ),
@@ -3916,11 +4424,42 @@ def dashboard_layout(
 
 
 @rx.page(route="/", on_load=AuthState.require_admin)
-def dashboard() -> rx.Component:
+def index() -> rx.Component:
     return dashboard_layout(
-        dashboard_cards(),
+        reports_cards(),
         active_destination="home",
-        subtitle="Aqui está um resumo do seu mercado hoje.",
+        subtitle="Aqui pode aceder aos seus dashboards",
+    )
+
+
+@rx.page(route="/estoque-baixo", on_load=EstoqueState.buscar_estoque_baixo)
+def estoque_baixo_page() -> rx.Component:
+    return dashboard_layout(
+        inventory_dashboard_page(
+            "Estoque baixo",
+            "Produtos com até 10 unidades disponíveis em lotes ainda válidos",
+            EstoqueState.figura_grafico,
+            EstoqueState.feedback,
+        ),
+        active_destination="home",
+        subtitle="Acompanhe os produtos que precisam de reposição",
+        scroll_content=True,
+    )
+
+
+@rx.page(route="/data-proxima", on_load=ValidadeState.buscar_validade_proxima)
+def data_proxima_page() -> rx.Component:
+    return dashboard_layout(
+        inventory_dashboard_page(
+            "Data próxima",
+            "Lotes com validade entre hoje e os próximos 15 dias",
+            ValidadeState.figura_grafico,
+            ValidadeState.feedback,
+            horizontal=True,
+        ),
+        active_destination="home",
+        subtitle="Acompanhe os produtos próximos do vencimento",
+        scroll_content=True,
     )
 
 
@@ -3970,6 +4509,32 @@ def relatorios_page() -> rx.Component:
     )
 
 
+@rx.page(
+    route="/relatorios/vendas-diarias",
+    on_load=SalesDashboardState.load_daily_sales,
+)
+def daily_sales_page() -> rx.Component:
+    return dashboard_layout(
+        sales_dashboard_page("Vendas diárias"),
+        active_destination="reports",
+        subtitle="Vendas concluídas por hora no dia atual",
+        scroll_content=True,
+    )
+
+
+@rx.page(
+    route="/relatorios/vendas-semanais",
+    on_load=SalesDashboardState.load_weekly_sales,
+)
+def weekly_sales_page() -> rx.Component:
+    return dashboard_layout(
+        sales_dashboard_page("Vendas semanais"),
+        active_destination="reports",
+        subtitle="Vendas concluídas nos últimos 7 dias",
+        scroll_content=True,
+    )
+
+
 @rx.page(route="/precos", on_load=PricesState.load_prices)
 def precos_page() -> rx.Component:
     return dashboard_layout(
@@ -3997,6 +4562,7 @@ app = rx.App(
         has_background=False,
         radius="small",
     ),
+    stylesheets=["/styles.css"],
     style={
         "html, body, #root": {
             "width": "100%",
@@ -4338,8 +4904,11 @@ app = rx.App(
             "background": "#D9D9D9 !important",
         },
         ".conference-date-input input": {
+            "display": "flex !important",
+            "justify_content": "center !important",
             "text_align": "center !important",
             "text_align_last": "center !important",
+            "text_indent": "0 !important",
         },
         ".conference-date-input::-webkit-datetime-edit, .conference-date-input input::-webkit-datetime-edit, .conference-date-input::-webkit-date-and-time-value, .conference-date-input input::-webkit-date-and-time-value": {
             "display": "flex",

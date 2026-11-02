@@ -1,3 +1,6 @@
 reflex==0.8.28.post1
 httpx==0.28.1
 supabase==2.33.0
+python-dotenv
+sqlalchemy[asyncio]
+plotly>=5.24,<7

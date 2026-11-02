@@ -7,5 +7,6 @@ assets/external/
 
 node_modules/
 .venv/
+.venv-py314/
 __pycache__/
 .env

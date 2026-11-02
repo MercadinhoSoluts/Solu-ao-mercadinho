@@ -47,6 +47,13 @@ def session_state(**values: object) -> SimpleNamespace:
 
 
 class AuthStateSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_editing_login_fields_clears_stale_feedback(self) -> None:
+        state = session_state(login_feedback="E-mail ou senha inválidos.")
+
+        AuthState.clear_login_feedback.fn(state, "updated@example.com")
+
+        self.assertEqual(state.login_feedback, "")
+
     async def test_login_stores_supabase_session_and_redirects_by_database_role(self) -> None:
         state = session_state()
         session = AuthSession("access-token", "refresh-token", 1_900_000_000)

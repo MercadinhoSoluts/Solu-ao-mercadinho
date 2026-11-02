@@ -931,6 +931,44 @@ async def list_current_prices(token: str) -> list[dict[str, Any]]:
         raise SupabaseApiError(500, "configuration_error", str(error)) from error
 
 
+async def list_completed_sales(
+    token: str,
+    start_at: str,
+    end_at: str,
+) -> list[dict[str, Any]]:
+    try:
+        async with request_supabase_client(token) as client:
+            response = await (
+                client.table("purchases")
+                .select("created_at, total_cents")
+                .eq("status", "completed")
+                .gte("created_at", start_at)
+                .lt("created_at", end_at)
+                .order("created_at")
+                .execute()
+            )
+        rows = response.data
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise SupabaseApiError(
+                502,
+                "invalid_response",
+                "O Supabase retornou uma lista de vendas inválida.",
+            )
+        return rows
+    except SupabaseApiError:
+        raise
+    except (AuthApiError, APIError) as error:
+        raise _translate_error(error) from error
+    except httpx.RequestError as error:
+        raise SupabaseApiError(
+            0,
+            "service_unavailable",
+            "Não foi possível consultar as vendas no Supabase.",
+        ) from error
+    except SupabaseConfigurationError as error:
+        raise SupabaseApiError(500, "configuration_error", str(error)) from error
+
+
 def _purchase_from_rpc(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise SupabaseApiError(

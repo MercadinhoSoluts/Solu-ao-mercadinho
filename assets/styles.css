@@ -1,0 +1,5 @@
+.registration-form-panel form .rt-SelectTrigger[data-placeholder],
+.registration-form-panel form .rt-SelectTrigger[data-placeholder] .rt-SelectTriggerInner,
+.registration-form-panel form .rt-SelectTrigger[data-placeholder] .rt-SelectTriggerInner span {
+  color: #000000 !important;
+}

@@ -1687,8 +1687,44 @@ def sidebar(
     )
 
 
-def dashboard_header(subtitle: str = "Aqui está um resumo do seu mercado hoje.") -> rx.Component:
+def management_clock() -> rx.Component:
     return rx.vstack(
+        rx.text(
+            rx.moment(
+                interval=60_000,
+                format="HH:mm",
+                local=True,
+                locale="pt-br",
+            ),
+            color="#000000",
+            font_size="clamp(1.45rem, 2.5vw, 2rem)",
+            font_weight="700",
+            line_height="1.1",
+        ),
+        rx.text(
+            rx.moment(
+                interval=60_000,
+                format="D [de] MMMM [de] YYYY",
+                local=True,
+                locale="pt-br",
+            ),
+            color="#000000",
+            font_size="0.82rem",
+            line_height="1.2",
+            text_align="right",
+        ),
+        align="end",
+        gap="0.15rem",
+        text_align="right",
+        class_name="management-page-clock",
+    )
+
+
+def dashboard_header(
+    subtitle: str = "Aqui está um resumo do seu mercado hoje.",
+    show_clock: bool = False,
+) -> rx.Component:
+    header_content = rx.vstack(
         rx.heading(
             "Olá, ",
             AuthState.user_name,
@@ -1704,7 +1740,15 @@ def dashboard_header(subtitle: str = "Aqui está um resumo do seu mercado hoje."
         ),
         align="start",
         gap="0.55rem",
+    )
+    return rx.flex(
+        header_content,
+        rx.cond(show_clock, management_clock(), rx.fragment()),
         width="100%",
+        align="start",
+        justify="between",
+        gap="1.25rem",
+        flex_wrap="wrap",
     )
 
 
@@ -1794,6 +1838,215 @@ def dashboard_cards() -> rx.Component:
         ),
         width="100%",
         align="center",
+    )
+
+
+def home_indicator_card(
+    label: str,
+    value: str,
+    detail: str,
+    icon: str,
+    color: str,
+) -> rx.Component:
+    return rx.box(
+        rx.box(
+            rx.icon(icon, size=22, color=color, stroke_width=2),
+            display="flex",
+            align_items="center",
+            justify_content="center",
+            width="2.75rem",
+            height="2.75rem",
+            border_radius="0.8rem",
+            background="#EFF6FF",
+            flex_shrink="0",
+        ),
+        rx.vstack(
+            rx.text(
+                label,
+                color="#64748B",
+                font_size="0.78rem",
+                font_weight="600",
+            ),
+            rx.text(
+                value,
+                color="#172033",
+                font_size="clamp(1.15rem, 2vw, 1.5rem)",
+                font_weight="750",
+                line_height="1.15",
+            ),
+            rx.text(detail, color="#94A3B8", font_size="0.72rem"),
+            align="start",
+            gap="0.2rem",
+            min_width="0",
+        ),
+        display="flex",
+        align_items="center",
+        gap="0.75rem",
+        width="100%",
+        min_width="0",
+        padding="1rem",
+        background="white",
+        border="1px solid #E8EDF3",
+        border_radius="0.85rem",
+        box_shadow="0 4px 14px rgba(23, 32, 51, 0.04)",
+    )
+
+
+def home_navigation_card(card: dict[str, str]) -> rx.Component:
+    accent_backgrounds = {
+        "#3B82F6": "#EFF6FF",
+        "#22C55E": "#F0FDF4",
+        "#F59E0B": "#FFFBEB",
+        "#EC4899": "#FDF2F8",
+        "#A3E635": "#F7FEE7",
+        "#8B5CF6": "#F5F3FF",
+    }
+    return rx.link(
+        rx.box(
+            rx.box(
+                rx.icon(
+                    SIDEBAR_ICONS.get(card["destination"], card["icon"]),
+                    size=28,
+                    color=card["color"],
+                    stroke_width=2,
+                ),
+                display="flex",
+                align_items="center",
+                justify_content="center",
+                width="3.5rem",
+                height="3.5rem",
+                border_radius="0.95rem",
+                background=accent_backgrounds.get(card["color"], "#EFF6FF"),
+                flex_shrink="0",
+            ),
+            rx.vstack(
+                rx.text(
+                    card["title"],
+                    color="#172033",
+                    font_size="1rem",
+                    font_weight="700",
+                ),
+                rx.text(
+                    card["description"],
+                    color="#7A8496",
+                    font_size="0.82rem",
+                    line_height="1.4",
+                ),
+                align="start",
+                gap="0.3rem",
+                min_width="0",
+            ),
+            display="flex",
+            align_items="center",
+            gap="0.8rem",
+            width="100%",
+            min_width="0",
+            min_height="9rem",
+            padding="1.35rem",
+            background="white",
+            border=f"1px solid {accent_backgrounds.get(card['color'], '#E8EDF3')}",
+            border_top=f"3px solid {card['color']}",
+            border_radius="0.9rem",
+            box_shadow="0 5px 18px rgba(23, 32, 51, 0.06)",
+            transition="transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease",
+            _hover={
+                "transform": "translateY(-2px)",
+                "box_shadow": "0 9px 24px rgba(23, 32, 51, 0.11)",
+                "border_color": card["color"],
+            },
+        ),
+        href=ROUTE_BY_DESTINATION[card["destination"]],
+        width="100%",
+        display="block",
+        text_decoration="none",
+        _focus_visible={"outline": "3px solid #93C5FD", "outline_offset": "3px"},
+    )
+
+
+def home_dashboard() -> rx.Component:
+    indicators = (
+        ("Relatórios disponíveis", "04", "Opções de análise", "chart-no-axes-column", "#2563EB"),
+        ("Visões de vendas", "02", "Diária e semanal", "trending-up", "#16A34A"),
+        ("Estoque baixo", "≤ 10 un.", "Limite do indicador", "package", "#D97706"),
+        ("Validade próxima", "15 dias", "Janela de análise", "calendar-days", "#DB2777"),
+    )
+    return rx.vstack(
+        rx.box(
+            *[home_navigation_card(card) for card in DASHBOARD_CARDS],
+            width="100%",
+            display="grid",
+            grid_template_columns=[
+                "1fr",
+                "repeat(2, minmax(0, 1fr))",
+                "repeat(2, minmax(0, 1fr))",
+                "repeat(3, minmax(0, 1fr))",
+            ],
+            gap="1.15rem",
+        ),
+        rx.card(
+            rx.vstack(
+                rx.hstack(
+                    rx.box(
+                        rx.icon("layout-dashboard", size=24, color="#2563EB", stroke_width=2),
+                        display="flex",
+                        align_items="center",
+                        justify_content="center",
+                        width="3rem",
+                        height="3rem",
+                        border_radius="0.85rem",
+                        background="#EFF6FF",
+                        flex_shrink="0",
+                    ),
+                    rx.box(
+                        width="1px",
+                        height="3rem",
+                        background="#DDE3EC",
+                        flex_shrink="0",
+                    ),
+                    rx.vstack(
+                        rx.heading("Visão geral", size="5", color="#172033"),
+                        rx.text(
+                            "Resumo rápido do seu mercado.",
+                            color="#7A8496",
+                            font_size="0.9rem",
+                        ),
+                        align="start",
+                        gap="0.2rem",
+                    ),
+                    align="center",
+                    gap="0.9rem",
+                    width="100%",
+                ),
+                rx.box(
+                    *[
+                        home_indicator_card(label, value, detail, icon, color)
+                        for label, value, detail, icon, color in indicators
+                    ],
+                    width="100%",
+                    display="grid",
+                    grid_template_columns=[
+                        "1fr",
+                        "repeat(2, minmax(0, 1fr))",
+                        "repeat(2, minmax(0, 1fr))",
+                        "repeat(4, minmax(0, 1fr))",
+                    ],
+                    gap="0.85rem",
+                ),
+                width="100%",
+                align="stretch",
+                gap="1.25rem",
+            ),
+            width="100%",
+            padding="clamp(1.25rem, 2.5vw, 2rem)",
+            background="white",
+            border="1px solid #E8EDF3",
+            border_radius="1rem",
+            box_shadow="0 10px 28px rgba(23, 32, 51, 0.07)",
+        ),
+        width="100%",
+        max_width="none",
+        align="stretch",
+        gap=["1.5rem", "1.5rem", "2rem", "2.5rem"],
     )
 
 
@@ -5705,6 +5958,7 @@ def dashboard_layout(
     subtitle: str = "Aqui está um resumo do seu mercado hoje.",
     fixed_sidebar: bool = False,
     scroll_content: bool = False,
+    show_clock: bool = False,
 ) -> rx.Component:
     content_area = (
         rx.box(
@@ -5746,7 +6000,7 @@ def dashboard_layout(
                     on_click=AuthState.toggle_sidebar,
                     class_name="sidebar-menu-trigger",
                 ),
-                dashboard_header(subtitle=subtitle),
+                dashboard_header(subtitle=subtitle, show_clock=show_clock),
                 content_area,
                 width="100%",
                 max_width="1440px",
@@ -5799,9 +6053,11 @@ def dashboard_layout(
 @rx.page(route="/", on_load=SalesDashboardState.load_report_sales)
 def index() -> rx.Component:
     return dashboard_layout(
-        reports_cards(),
+        home_dashboard(),
         active_destination="home",
-        subtitle="Aqui pode aceder aos seus dashboards",
+        subtitle="Resumo rápido do seu mercado.",
+        scroll_content=True,
+        show_clock=True,
     )
 
 
@@ -5843,6 +6099,7 @@ def registration_page() -> rx.Component:
         active_destination="registration",
         subtitle="Aqui você pode adicionar funcionários novos ao sistema de gerenciamento do mercado",
         fixed_sidebar=True,
+        show_clock=True,
     )
 
 
@@ -5852,6 +6109,7 @@ def estoque_page() -> rx.Component:
         inventory_panel(),
         active_destination="inventory",
         subtitle="Aqui está o estoque do mercado",
+        show_clock=True,
     )
 
 
@@ -5861,6 +6119,7 @@ def conferencia_page() -> rx.Component:
         conference_form_panel(),
         active_destination="receiving",
         subtitle="Aqui você pode adicionar produtos recém entregues pelo fornecedor ao seu estoque",
+        show_clock=True,
     )
 
 
@@ -5870,6 +6129,7 @@ def produtos_page() -> rx.Component:
         product_form_panel(),
         active_destination="products",
         subtitle="Aqui você pode registrar produtos novos ao sistema do mercado",
+        show_clock=True,
     )
 
 
@@ -5880,6 +6140,7 @@ def relatorios_page() -> rx.Component:
         active_destination="reports",
         subtitle="Aqui você pode acessar seus dashboards",
         scroll_content=True,
+        show_clock=True,
     )
 
 
@@ -5917,6 +6178,7 @@ def precos_page() -> rx.Component:
         subtitle="Aqui você pode cadastrar e consultar preços dos produtos",
         fixed_sidebar=True,
         scroll_content=True,
+        show_clock=True,
     )
 
 

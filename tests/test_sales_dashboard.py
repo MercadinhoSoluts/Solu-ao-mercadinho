@@ -10,6 +10,11 @@ from bipsystem.bipsystem import (
     EstoqueState,
     SalesDashboardState,
     ValidadeState,
+    inventory_risk_chart,
+    inventory_risk_chart_row,
+    inventory_risk_table,
+    report_stock_bar_row,
+    report_stock_chart,
     reports_cards,
     sales_dashboard_page,
 )
@@ -99,16 +104,74 @@ class SalesQueryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SalesCardNavigationTests(unittest.TestCase):
-    def test_sales_cards_use_internal_navigation_in_the_current_tab(self) -> None:
+    def test_report_cards_open_detail_dialogs(self) -> None:
         component = reports_cards()
-        card_links = component.children
+        self.assertEqual(len(component.children), 3)
+        self.assertEqual(type(component.children[1]).__name__, "Card")
+        self.assertEqual(type(component.children[2]).__name__, "Card")
 
-        self.assertEqual(len(card_links), len(REPORT_CARDS))
-        for link, card in zip(card_links, REPORT_CARDS, strict=True):
-            router_link = link.children[0]
-            self.assertEqual(router_link.to._var_value, card["href"])
-            self.assertIsNone(link.is_external)
-            self.assertIsNone(link.target)
+        chart_grid = component.children[1].children[0].children[1]
+        dialogs = chart_grid.children
+
+        self.assertEqual(len(dialogs), len(REPORT_CARDS))
+        for dialog in dialogs:
+            self.assertEqual(type(dialog).__name__, "DialogRoot")
+            self.assertEqual(len(dialog.children), 2)
+            self.assertEqual(type(dialog.children[0]).__name__, "DialogTrigger")
+            self.assertEqual(type(dialog.children[1]).__name__, "DialogContent")
+
+        stock_dialog = dialogs[1].children[1]
+        self.assertEqual(stock_dialog.width, "min(92vw, 56.25rem)")
+        self.assertEqual(stock_dialog.max_width, "56.25rem")
+        self.assertEqual(stock_dialog.height, "min(80vh, 31.625rem)")
+        self.assertEqual(
+            type(stock_dialog.children[0].children[2]).__name__,
+            "Center",
+        )
+
+        self.assertEqual(
+            [card["href"] for card in REPORT_CARDS],
+            [
+                "/data-proxima",
+                "/estoque-baixo",
+                "/relatorios/vendas-semanais",
+                "/relatorios/vendas-diarias",
+            ],
+        )
+
+    def test_low_stock_report_uses_scroll_free_horizontal_bars(self) -> None:
+        chart = report_stock_chart(EstoqueState.produtos_estoque_critico, "15rem")
+
+        self.assertEqual(type(chart.children[0]).__name__, "Cond")
+
+    def test_low_stock_product_label_matches_bar_color(self) -> None:
+        row = report_stock_bar_row("Produto", 0, 4)
+        label = row.children[0]
+        bar = row.children[1].children[0]
+
+        self.assertEqual(label.color, bar.background)
+
+    def test_critical_stock_view_filters_above_limit_and_keeps_zero(self) -> None:
+        figure = {
+            "data": [
+                {
+                    "x": ["Zero", "Limite", "Acima"],
+                    "y": [0, 10, 11],
+                }
+            ]
+        }
+
+        self.assertEqual(
+            EstoqueState._critical_stock_products_from_figure(figure),
+            [
+                ("Zero", 0),
+                ("Limite", 10),
+            ],
+        )
+        self.assertEqual(
+            EstoqueState._critical_stock_products_from_figure({"data": []}),
+            [],
+        )
 
     def test_inventory_cards_link_to_their_dedicated_dashboards(self) -> None:
         self.assertEqual(REPORT_CARDS[0]["href"], "/data-proxima")
@@ -220,3 +283,40 @@ class InventoryDashboardFigureTests(unittest.TestCase):
         )
         self.assertEqual(trace["x"], [0, 15])
         self.assertEqual(trace["customdata"], [5, 3])
+
+
+class InventoryDashboardLayoutTests(unittest.TestCase):
+    def test_inventory_dashboards_render_bar_rows_and_data_tables(self) -> None:
+        for figure, expiring in (
+            (EstoqueState.figura_grafico, False),
+            (ValidadeState.figura_grafico, True),
+        ):
+            with self.subTest(expiring=expiring):
+                chart = inventory_risk_chart(figure, expiring=expiring)
+                table = inventory_risk_table(figure, expiring=expiring)
+
+                self.assertEqual(type(chart).__name__, "VStack")
+                self.assertEqual(type(chart.children[1]).__name__, "Grid")
+                self.assertEqual(
+                    type(chart.children[1].children[0]).__name__,
+                    "Foreach",
+                )
+                self.assertEqual(
+                    chart.children[1].grid_template_columns,
+                    "repeat(auto-fit, minmax(7.5rem, 1fr))",
+                )
+                self.assertEqual(type(table.children[0]).__name__, "TableRoot")
+                self.assertEqual(
+                    type(table.children[0].children[1].children[0]).__name__,
+                    "Foreach",
+                )
+                self.assertNotIn("max_height", table.style)
+                self.assertNotIn("overflow_x", table.style)
+                self.assertNotIn("overflow_y", table.style)
+
+    def test_inventory_bar_labels_and_bars_share_product_color(self) -> None:
+        row = inventory_risk_chart_row("Produto", 0, 4, scale=10)
+        label = row.children[2]
+        bar = row.children[1].children[0]
+
+        self.assertEqual(label.color, bar.background)

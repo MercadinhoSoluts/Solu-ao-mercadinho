@@ -1166,7 +1166,7 @@ def field(
 @rx.page(route="/login")
 def login_page() -> rx.Component:
     return rx.box(
-        rx.box(
+        rx.card(
             rx.box(
                 position="absolute",
                 width="clamp(18rem, 38vw, 34rem)",
@@ -1704,7 +1704,7 @@ def dashboard_header(subtitle: str = "Aqui está um resumo do seu mercado hoje."
         ),
         align="start",
         gap="0.55rem",
-        transform="translateX(-80px)",
+        width="100%",
     )
 
 
@@ -1797,56 +1797,502 @@ def dashboard_cards() -> rx.Component:
     )
 
 
-def report_dashboard_card(card: dict[str, str]) -> rx.Component:
-    return rx.link(
-        rx.card(
+def report_stock_color(index: Any) -> Any:
+    hue = (index * 137.508) % 360
+    if isinstance(hue, (int, float)):
+        return f"hsl({hue}, 72%, 48%)"
+    return "hsl(" + hue.to(str) + ", 72%, 48%)"
+
+
+def report_stock_bar_row(product: Any, index: Any, quantity: Any) -> rx.Component:
+    color = report_stock_color(index)
+    bar_width = rx.cond(quantity >= 10, 100, quantity * 10).to(str) + "%"
+    return rx.grid(
+        rx.text(
+            product,
+            color=color,
+            font_size="0.66rem",
+            font_weight="600",
+            line_height="1.15",
+            white_space="nowrap",
+            overflow="hidden",
+            text_overflow="ellipsis",
+            title=product,
+        ),
+        rx.box(
+            rx.box(
+                width=bar_width,
+                height="100%",
+                border_radius="0.2rem",
+                background=color,
+            ),
+            width="100%",
+            height="0.72rem",
+            display="flex",
+            align_items="center",
+            border_radius="0.2rem",
+            background="#EEF2F6",
+            background_image="linear-gradient(to right, #DCE3EC 1px, transparent 1px)",
+            background_size="25% 100%",
+            overflow="hidden",
+        ),
+        rx.text(
+            quantity,
+            color="#475569",
+            font_size="0.66rem",
+            font_weight="600",
+            text_align="right",
+        ),
+        width="100%",
+        min_width="0",
+        grid_template_columns="minmax(0, 1.4fr) minmax(3rem, 1fr) 1.75rem",
+        align_items="center",
+        gap="0.55rem",
+    )
+
+
+def report_stock_chart(products: Any, height: str) -> rx.Component:
+    return rx.cond(
+        products.length() > 0,
+        rx.vstack(
+            rx.text(
+                "Quantidade em estoque",
+                color="#64748B",
+                font_size="0.72rem",
+                font_weight="700",
+            ),
             rx.vstack(
-                rx.box(
-                    rx.icon(card["icon"], size=26, color="white", stroke_width=2),
-                    display="flex",
-                    align_items="center",
-                    justify_content="center",
-                    width="3.5rem",
-                    height="3.5rem",
-                    border_radius="50%",
-                    background=card["color"],
+                rx.foreach(
+                    products,
+                    lambda product, index: report_stock_bar_row(
+                        product[0],
+                        index,
+                        product[1],
+                    ),
                 ),
-                rx.heading(
-                    card["title"],
-                    size="4",
-                    color="#172033",
-                    text_align="center",
-                ),
+                width="100%",
+                align="stretch",
+                gap="0.55rem",
+            ),
+            width="100%",
+            min_height=height,
+            align="stretch",
+            gap="0.65rem",
+        ),
+        rx.center(
+            rx.vstack(
+                rx.icon("circle-check", size=24, color="#16A34A"),
                 rx.text(
-                    card["description"],
-                    color="#7A8496",
-                    font_size="0.91rem",
-                    line_height="1.45",
+                    "Estoque normalizado. Nenhum produto em nível crítico.",
+                    color="#15803D",
+                    font_weight="600",
                     text_align="center",
                 ),
                 align="center",
-                justify="center",
-                gap="0.85rem",
-                width="100%",
-                min_height="12rem",
+                gap="0.5rem",
             ),
             width="100%",
-            height="100%",
-            padding="1.5rem 1.15rem",
-            background="white",
-            border_radius="0.7rem",
-            box_shadow="0 5px 18px rgba(23, 32, 51, 0.08)",
-            transition="transform 160ms ease, box-shadow 160ms ease",
-            _hover={
-                "transform": "translateY(-4px)",
-                "box_shadow": "0 9px 24px rgba(23, 32, 51, 0.14)",
-            },
+            min_height=height,
+            padding="1rem",
+            background="#F0FDF4",
+            border_radius="0.65rem",
         ),
-        href=card["href"],
+    )
+
+
+def report_chart_plot(
+    figure_data: Any,
+    feedback: Any,
+    *,
+    height: str,
+    horizontal: bool = False,
+    low_stock: bool = False,
+    xaxis_title: str,
+    yaxis_title: str,
+    period: str | None = None,
+) -> rx.Component:
+    if low_stock:
+        plot = report_stock_chart(EstoqueState.produtos_estoque_critico, height)
+    elif period is not None:
+        weekly_data = [
+            {
+                "label": SalesDashboardState.weekly_chart_labels[index],
+                "sales": SalesDashboardState.weekly_chart_values[index],
+                "previous_sales": (
+                    SalesDashboardState.weekly_chart_values[index] * 0.84 + 2.5
+                ),
+            }
+            for index in range(7)
+        ]
+        daily_data = [
+            {
+                "label": SalesDashboardState.chart_labels[index],
+                "sales": SalesDashboardState.chart_values[index],
+                "previous_sales": (
+                    SalesDashboardState.chart_values[index] * 0.84 + 2.5
+                ),
+            }
+            for index in range(24)
+        ]
+        plot = rx.box(
+            rx.recharts.area_chart(
+                rx.recharts.cartesian_grid(
+                    stroke="#E2E8F0",
+                    stroke_dasharray="3 3",
+                    vertical=False,
+                ),
+                rx.recharts.x_axis(
+                    data_key="label",
+                    tick_line=False,
+                    axis_line=False,
+                    tick={"fontSize": 11, "fill": "#94A3B8"},
+                ),
+                rx.recharts.y_axis(
+                    tick_line=False,
+                    axis_line=False,
+                    tick={"fontSize": 12, "fill": "#94A3B8"},
+                ),
+                rx.recharts.legend(
+                    vertical_align="top",
+                    align="right",
+                    wrapper_style={"paddingBottom": "8px", "fontSize": "12px"},
+                ),
+                rx.recharts.graphing_tooltip(
+                    content_style={
+                        "backgroundColor": "#FFFFFF",
+                        "border": "1px solid #E2E8F0",
+                        "borderRadius": "8px",
+                        "boxShadow": "0 8px 20px rgba(15, 23, 42, 0.12)",
+                    },
+                    label_style={"color": "#334155", "fontWeight": 600},
+                    item_style={"color": "#475569"},
+                ),
+                rx.recharts.area(
+                    data_key="sales",
+                    type_="monotone",
+                    name="Vendas do período",
+                    stroke="#10B981",
+                    stroke_width=2.5,
+                    fill="#10B981",
+                    fill_opacity=0.16,
+                    active_dot={"r": 4},
+                ),
+                rx.recharts.area(
+                    data_key="previous_sales",
+                    type_="monotone",
+                    name="Semana passada (mock)",
+                    stroke="#F59E0B",
+                    stroke_width=1.75,
+                    fill="#F59E0B",
+                    fill_opacity=0.05,
+                    active_dot={"r": 3},
+                ),
+                data=weekly_data if period == "weekly" else daily_data,
+                width="100%",
+                height="100%",
+            ),
+            width="100%",
+            height=height,
+        )
+    else:
+        plot = rx.plotly(
+            data=figure_data.to(Figure),
+            layout={
+                "autosize": True,
+                "height": 520 if horizontal else 320,
+                "margin": {
+                    "l": 150 if horizontal else 42,
+                    "r": 18,
+                    "t": 16,
+                    "b": 48,
+                },
+                "paper_bgcolor": "white",
+                "plot_bgcolor": "white",
+                "font": {"family": "Inter, sans-serif", "color": "#64748B"},
+                "showlegend": False,
+                "hovermode": "closest",
+                "xaxis": {
+                    "title": xaxis_title,
+                    "showgrid": horizontal,
+                    "gridcolor": "#EEF2F6",
+                    "zerolinecolor": "#E2E8F0",
+                    "showline": False,
+                    "automargin": True,
+                },
+                "yaxis": {
+                    "title": yaxis_title,
+                    "showgrid": not horizontal,
+                    "gridcolor": "#EEF2F6",
+                    "zerolinecolor": "#E2E8F0",
+                    "showline": False,
+                    "rangemode": "tozero" if not horizontal else None,
+                    "autorange": "reversed" if horizontal else True,
+                    "automargin": True,
+                },
+            },
+            width="100%",
+            height=height,
+        )
+    if period is not None:
+        chart_labels = (
+            SalesDashboardState.weekly_chart_labels
+            if period == "weekly"
+            else SalesDashboardState.chart_labels
+        )
+        plot = rx.cond(
+            chart_labels.length() > 0,
+            plot,
+            rx.center(
+                rx.vstack(
+                    rx.icon("chart-no-axes-column", size=22, color="#94A3B8"),
+                    rx.text(
+                        "Abra o relatório para carregar os dados deste período.",
+                        color="#64748B",
+                        font_size="0.82rem",
+                        text_align="center",
+                    ),
+                    align="center",
+                    gap="0.5rem",
+                ),
+                height=height,
+                padding="1rem",
+                background="#F8FAFC",
+                border_radius="0.65rem",
+            ),
+        )
+    return rx.cond(
+        feedback != "",
+        rx.text(feedback, color="#B42318", role="alert"),
+        plot,
+    )
+
+
+def report_chart_panel(
+    card: dict[str, str],
+    figure_data: Any,
+    feedback: Any,
+    *,
+    xaxis_title: str,
+    yaxis_title: str,
+    horizontal: bool = False,
+    low_stock: bool = False,
+    period: str | None = None,
+) -> rx.Component:
+    chart = report_chart_plot(
+        figure_data,
+        feedback,
+        height="15rem",
+        horizontal=horizontal,
+        low_stock=low_stock,
+        xaxis_title=xaxis_title,
+        yaxis_title=yaxis_title,
+        period=period,
+    )
+    return rx.dialog.root(
+        rx.dialog.trigger(
+            rx.card(
+                rx.vstack(
+                    rx.hstack(
+                        rx.box(
+                            rx.icon(card["icon"], size=19, color=card["color"]),
+                            display="flex",
+                            align_items="center",
+                            justify_content="center",
+                            width="2.65rem",
+                            height="2.65rem",
+                            flex_shrink="0",
+                            border_radius="0.75rem",
+                            background="#F1F5F9",
+                        ),
+                        rx.vstack(
+                            rx.heading(card["title"], size="3", color="#172033"),
+                            rx.text(
+                                card["description"],
+                                color="#7A8496",
+                                font_size="0.78rem",
+                            ),
+                            align="start",
+                            gap="0.15rem",
+                            min_width="0",
+                        ),
+                        rx.icon(
+                            "maximize-2",
+                            size=17,
+                            color="#94A3B8",
+                            margin_left="auto",
+                        ),
+                        align="center",
+                        width="100%",
+                        gap="0.75rem",
+                    ),
+                    chart,
+                    rx.text(
+                        "Clique para ampliar",
+                        color="#64748B",
+                        font_size="0.75rem",
+                        align_self="end",
+                    ),
+                    width="100%",
+                    align="stretch",
+                    gap="0.75rem",
+                ),
+                width="100%",
+                min_width="0",
+                padding="1rem",
+                border="1px solid #E8EDF3",
+                border_radius="0.9rem",
+                background="white",
+                box_shadow="0 4px 14px rgba(23, 32, 51, 0.04)",
+                cursor="pointer",
+                text_align="left",
+                transition="border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease",
+                _hover={
+                    "border_color": "#C7D7EA",
+                    "box_shadow": "0 10px 24px rgba(23, 32, 51, 0.08)",
+                    "transform": "translateY(-2px)",
+                },
+                _focus_visible={
+                    "outline": "3px solid #93C5FD",
+                    "outline_offset": "2px",
+                },
+                role="button",
+                tab_index=0,
+            ),
+            as_child=True,
+        ),
+        rx.dialog.content(
+            rx.vstack(
+                rx.hstack(
+                    rx.vstack(
+                        rx.dialog.title(
+                            card["title"],
+                            color="#172033",
+                            font_size="1.35rem",
+                            font_weight="700",
+                        ),
+                        rx.dialog.description(
+                            card["description"],
+                            color="#64748B",
+                            font_size="0.9rem",
+                        ),
+                        align="start",
+                        gap="0.2rem",
+                        min_width="0",
+                    ),
+                    rx.dialog.close(
+                        rx.button(
+                            rx.icon("x", size=19),
+                            "Fechar",
+                            type="button",
+                            variant="soft",
+                            color="#334155",
+                            background="#F1F5F9",
+                        ),
+                        as_child=True,
+                    ),
+                    width="100%",
+                    align="start",
+                    justify="between",
+                    gap="1rem",
+                ),
+                report_chart_plot(
+                    figure_data,
+                    feedback,
+                    height="min(38vh, 24rem)",
+                    horizontal=horizontal,
+                    low_stock=low_stock,
+                    xaxis_title=xaxis_title,
+                    yaxis_title=yaxis_title,
+                    period=period,
+                ),
+                rx.center(
+                    rx.link(
+                        rx.button(
+                            "Abrir relatório completo",
+                            rx.icon("arrow-up-right", size=16),
+                            type="button",
+                            background="#2563EB",
+                            color="white",
+                            _hover={"background": "#1D4ED8"},
+                        ),
+                        href=card["href"],
+                        text_decoration="none",
+                    ),
+                    width="100%",
+                ),
+                width="100%",
+                align="stretch",
+                gap="1.25rem",
+            ),
+            width="min(92vw, 56.25rem)",
+            max_width="56.25rem",
+            height="min(80vh, 31.625rem)",
+            max_height="90vh",
+            overflow_y="auto",
+            scrollbar_gutter="stable both-edges",
+            padding="clamp(1.25rem, 3vw, 2rem)",
+            border_radius="1rem",
+            background="white",
+            box_shadow=(
+                "0 0 0 100vmax rgba(15, 23, 42, 0.62), "
+                "0 24px 80px rgba(15, 23, 42, 0.28)"
+            ),
+            position="fixed",
+            top="50%",
+            left="50%",
+            transform="translate(-50%, -50%)",
+            z_index="1001",
+            class_name="reports-detail-dialog",
+        ),
+    )
+
+
+def report_summary_table(
+    title: str,
+    rows: tuple[tuple[str, str], ...],
+) -> rx.Component:
+    return rx.vstack(
+        rx.heading(title, size="3", color="#172033"),
+        rx.table.root(
+            rx.table.header(
+                rx.table.row(
+                    rx.table.column_header_cell(
+                        "Relatório",
+                        font_weight="700",
+                        color="#475569",
+                    ),
+                    rx.table.column_header_cell(
+                        "Período / critério",
+                        font_weight="700",
+                        color="#475569",
+                        text_align="right",
+                    ),
+                )
+            ),
+            rx.table.body(
+                *[
+                    rx.table.row(
+                        rx.table.row_header_cell(
+                            label,
+                            color="#334155",
+                            font_weight="600",
+                        ),
+                        rx.table.cell(
+                            value,
+                            color="#64748B",
+                            text_align="right",
+                        ),
+                        background="#F8FAFC" if index % 2 == 0 else "white",
+                    )
+                    for index, (label, value) in enumerate(rows)
+                ]
+            ),
+            width="100%",
+            variant="ghost",
+        ),
         width="100%",
-        display="block",
-        text_decoration="none",
-        _focus_visible={"outline": "3px solid #93C5FD", "outline_offset": "3px"},
+        align="stretch",
+        gap="0.65rem",
     )
 
 
@@ -1854,6 +2300,9 @@ class SalesDashboardState(rx.State):
     period: str = "daily"
     chart_labels: list[str] = []
     chart_values: list[float] = []
+    weekly_chart_labels: list[str] = []
+    weekly_chart_values: list[float] = []
+    weekly_feedback: str = ""
     chart_data: dict[str, Any] = {
         "data": [
             {
@@ -1983,11 +2432,39 @@ class SalesDashboardState(rx.State):
                 ]
             }
             self.feedback = ""
+            if period == "weekly":
+                self.weekly_chart_labels = self.chart_labels.copy()
+                self.weekly_chart_values = self.chart_values.copy()
+                self.weekly_feedback = ""
         except SupabaseApiError as error:
             self.chart_labels = []
             self.chart_values = []
             self.chart_data = {"data": []}
             self.feedback = error.message
+            if period == "weekly":
+                self.weekly_chart_labels = []
+                self.weekly_chart_values = []
+                self.weekly_feedback = error.message
+
+    async def load_report_sales(self) -> Any:
+        daily_redirect = await self._load_sales("daily")
+        if daily_redirect is not None:
+            return daily_redirect
+
+        daily_labels = self.chart_labels.copy()
+        daily_values = self.chart_values.copy()
+        daily_chart_data = self.chart_data
+        daily_feedback = self.feedback
+
+        weekly_redirect = await self._load_sales("weekly")
+
+        self.period = "daily"
+        self.chart_labels = daily_labels
+        self.chart_values = daily_values
+        self.chart_data = daily_chart_data
+        self.feedback = daily_feedback
+        if weekly_redirect is not None:
+            return weekly_redirect
 
     async def load_daily_sales(self) -> Any:
         return await self._load_sales("daily")
@@ -2001,6 +2478,26 @@ class EstoqueState(rx.State):
         "data": [{"type": "bar", "x": [], "y": [], "marker": {"color": "#EF4444"}}]
     }
     feedback: str = ""
+
+    @staticmethod
+    def _critical_stock_products_from_figure(
+        figure: dict[str, Any],
+    ) -> list[tuple[str, int]]:
+        traces = figure.get("data", [])
+        if not traces or not isinstance(traces[0], dict):
+            return []
+
+        products = traces[0].get("x", [])
+        quantities = traces[0].get("y", [])
+        return [
+            (str(product), quantity)
+            for product, quantity in zip(products, quantities)
+            if isinstance(quantity, int) and quantity <= 10
+        ]
+
+    @rx.var
+    def produtos_estoque_critico(self) -> list[tuple[str, int]]:
+        return self._critical_stock_products_from_figure(self.figura_grafico)
 
     @staticmethod
     def _build_figure(
@@ -2661,14 +3158,251 @@ def prices_panel() -> rx.Component:
 
 
 def reports_cards() -> rx.Component:
-    return rx.box(
-        *[report_dashboard_card(card) for card in REPORT_CARDS],
+    report_specs = (
+        (
+            REPORT_CARDS[0],
+            ValidadeState.figura_grafico,
+            ValidadeState.feedback,
+            "Dias até o vencimento",
+            "Produto",
+            True,
+            False,
+            None,
+        ),
+        (
+            REPORT_CARDS[1],
+            EstoqueState.figura_grafico,
+            EstoqueState.feedback,
+            "Produto",
+            "Unidades disponíveis",
+            False,
+            True,
+            None,
+        ),
+        (
+            REPORT_CARDS[2],
+            SalesDashboardState.chart_data,
+            SalesDashboardState.weekly_feedback,
+            "Data",
+            "Vendas (R$)",
+            False,
+            False,
+            "weekly",
+        ),
+        (
+            REPORT_CARDS[3],
+            SalesDashboardState.chart_data,
+            SalesDashboardState.feedback,
+            "Hora",
+            "Vendas (R$)",
+            False,
+            False,
+            "daily",
+        ),
+    )
+    kpis = (
+        ("Relatórios disponíveis", "04", "Opções de análise", "chart-no-axes-column", "#2563EB"),
+        ("Visões de vendas", "02", "Diária e semanal", "trending-up", "#16A34A"),
+        ("Estoque baixo", "≤ 10 un.", "Limite do indicador", "package", "#D97706"),
+        ("Validade próxima", "15 dias", "Janela de análise", "calendar-days", "#DB2777"),
+    )
+    return rx.vstack(
+        rx.box(
+            *[
+                rx.card(
+                    rx.hstack(
+                        rx.box(
+                            rx.icon(icon, size=25, color=color),
+                            display="flex",
+                            align_items="center",
+                            justify_content="center",
+                            width="3.4rem",
+                            height="3.4rem",
+                            flex_shrink="0",
+                            border_radius="0.9rem",
+                            background="#F1F5F9" if index != 1 else "#DCFCE7",
+                        ),
+                        rx.vstack(
+                            rx.text(
+                                label,
+                                color="#64748B",
+                                font_size="0.78rem",
+                                font_weight="600",
+                            ),
+                            rx.text(
+                                value,
+                                color="#172033",
+                                font_size="clamp(1.2rem, 2vw, 1.65rem)",
+                                font_weight="750",
+                                line_height="1.15",
+                            ),
+                            rx.text(
+                                detail,
+                                color="#94A3B8",
+                                font_size="0.72rem",
+                            ),
+                            align="start",
+                            gap="0.2rem",
+                            min_width="0",
+                        ),
+                        width="100%",
+                        align="center",
+                        gap="0.8rem",
+                    ),
+                    width="100%",
+                    min_width="0",
+                    padding="1rem",
+                    background="white" if index != 1 else "#F0FDF4",
+                    border="1px solid #E8EDF3" if index != 1 else "1px solid #BBF7D0",
+                    border_radius="0.9rem",
+                    box_shadow="0 4px 14px rgba(23, 32, 51, 0.04)",
+                )
+                for index, (label, value, detail, icon, color) in enumerate(kpis)
+            ],
+            width="100%",
+            display="grid",
+            grid_template_columns=[
+                "minmax(0, 1fr)",
+                "repeat(2, minmax(0, 1fr))",
+                "repeat(2, minmax(0, 1fr))",
+                "repeat(4, minmax(0, 1fr))",
+            ],
+            gap="0.85rem",
+            class_name="reports-kpi-grid",
+        ),
+        rx.card(
+            rx.vstack(
+                rx.flex(
+                    rx.vstack(
+                        rx.heading("Visão geral", size="4", color="#172033"),
+                        rx.text(
+                            "Selecione um gráfico para ampliar os dados.",
+                            color="#7A8496",
+                            font_size="0.85rem",
+                        ),
+                        align="start",
+                        gap="0.2rem",
+                    ),
+                    rx.hstack(
+                        rx.hstack(
+                            rx.box(
+                                width="0.55rem",
+                                height="0.55rem",
+                                border_radius="50%",
+                                background="#22C55E",
+                            ),
+                            rx.text("Vendas", color="#64748B", font_size="0.75rem"),
+                            align="center",
+                            gap="0.35rem",
+                        ),
+                        rx.hstack(
+                            rx.box(
+                                width="0.55rem",
+                                height="0.55rem",
+                                border_radius="50%",
+                                background="#EF4444",
+                            ),
+                            rx.text("Estoque / validade", color="#64748B", font_size="0.75rem"),
+                            align="center",
+                            gap="0.35rem",
+                        ),
+                        flex_wrap="wrap",
+                        align="center",
+                        gap="0.8rem",
+                    ),
+                    width="100%",
+                    flex_direction=["column", "row"],
+                    align_items=["flex-start", "center"],
+                    justify_content=["flex-start", "space-between"],
+                    gap="0.8rem",
+                    class_name="reports-overview-header",
+                ),
+                rx.grid(
+                    *[
+                        report_chart_panel(
+                            card,
+                            figure_data,
+                            feedback,
+                            xaxis_title=xaxis_title,
+                            yaxis_title=yaxis_title,
+                            horizontal=horizontal,
+                            low_stock=low_stock,
+                            period=period,
+                        )
+                        for (
+                            card,
+                            figure_data,
+                            feedback,
+                            xaxis_title,
+                            yaxis_title,
+                            horizontal,
+                            low_stock,
+                            period,
+                        ) in report_specs
+                    ],
+                    width="100%",
+                    grid_template_columns=[
+                        "minmax(0, 1fr)",
+                        "minmax(0, 1fr)",
+                        "repeat(2, minmax(0, 1fr))",
+                        "repeat(4, minmax(0, 1fr))",
+                    ],
+                    gap="0.9rem",
+                    class_name="reports-chart-grid",
+                ),
+                width="100%",
+                align="stretch",
+                gap="1rem",
+            ),
+            width="100%",
+            padding="clamp(1rem, 2vw, 1.5rem)",
+            border="1px solid #E8EDF3",
+            border_radius="1rem",
+            background="white",
+            box_shadow="0 6px 20px rgba(23, 32, 51, 0.04)",
+        ),
+        rx.card(
+            rx.vstack(
+                rx.heading("Resumo", size="4", color="#172033"),
+                rx.grid(
+                    report_summary_table(
+                        "Vendas",
+                        (
+                            ("Vendas diárias", "Hoje · 24 horas"),
+                            ("Vendas semanais", "Últimos 7 dias"),
+                        ),
+                    ),
+                    report_summary_table(
+                        "Estoque",
+                        (
+                            ("Estoque baixo", "Até 10 unidades"),
+                            ("Validade próxima", "Próximos 15 dias"),
+                        ),
+                    ),
+                    width="100%",
+                    grid_template_columns=[
+                        "minmax(0, 1fr)",
+                        "minmax(0, 1fr)",
+                        "repeat(2, minmax(0, 1fr))",
+                    ],
+                    gap="1.25rem",
+                    class_name="reports-summary-grid",
+                ),
+                width="100%",
+                align="stretch",
+                gap="1rem",
+            ),
+            width="100%",
+            padding="clamp(1rem, 2vw, 1.5rem)",
+            border="1px solid #E8EDF3",
+            border_radius="1rem",
+            background="white",
+            box_shadow="0 6px 20px rgba(23, 32, 51, 0.04)",
+        ),
         width="100%",
-        max_width="62rem",
-        display="grid",
-        grid_template_columns="1fr",
-        class_name="dashboard-card-grid dashboard-card-grid-reports",
-        gap="2.5rem",
+        max_width="none",
+        align="stretch",
+        gap="1.5rem",
     )
 
 
@@ -2690,50 +3424,314 @@ def dashboard_home_button() -> rx.Component:
 
 
 def sales_dashboard_page(title: str) -> rx.Component:
+    is_weekly = title.endswith("semanais")
+    period = "weekly" if is_weekly else "daily"
+    period_description = (
+        "Acompanhe as vendas de cada dia dos últimos 7 dias."
+        if is_weekly
+        else "Acompanhe a distribuição das vendas ao longo das 24 horas do dia."
+    )
+    period_feedback = (
+        SalesDashboardState.weekly_feedback
+        if is_weekly
+        else SalesDashboardState.feedback
+    )
+    comparison_href = (
+        "/relatorios/vendas-diarias"
+        if is_weekly
+        else "/relatorios/vendas-semanais"
+    )
+    comparison_label = (
+        "Ver vendas por horário"
+        if is_weekly
+        else "Ver vendas dos últimos 7 dias"
+    )
+    comparison_icon = "clock-3" if is_weekly else "calendar-days"
+    comparison_note = (
+        "A série amarela é demonstrativa; os valores históricos da semana anterior ainda não estão disponíveis."
+        if is_weekly
+        else "A série amarela mostra uma comparação demonstrativa com a semana anterior."
+    )
+
     return rx.vstack(
         dashboard_home_button(),
         rx.card(
             rx.vstack(
-                rx.heading(title, size="5", color="#172033"),
+                rx.flex(
+                    rx.vstack(
+                        rx.heading(title, size="5", color="#172033"),
+                        rx.text(
+                            period_description,
+                            color="#64748B",
+                            font_size="0.9rem",
+                        ),
+                        align="start",
+                        gap="0.35rem",
+                    ),
+                    rx.link(
+                        rx.button(
+                            rx.icon(comparison_icon, size=16),
+                            comparison_label,
+                            variant="soft",
+                            color_scheme="green",
+                        ),
+                        href=comparison_href,
+                        text_decoration="none",
+                    ),
+                    width="100%",
+                    flex_direction=["column", "row"],
+                    align_items=["flex-start", "center"],
+                    justify_content=["flex-start", "space-between"],
+                    gap="1rem",
+                ),
                 rx.cond(
-                    SalesDashboardState.feedback != "",
+                    period_feedback != "",
                     rx.text(
-                        SalesDashboardState.feedback,
+                        period_feedback,
                         color="#B42318",
                         role="alert",
                     ),
-                    rx.plotly(
-                        data=SalesDashboardState.chart_data.to(Figure),
-                        layout={
-                            "autosize": True,
-                            "height": 420,
-                            "margin": {"l": 60, "r": 24, "t": 24, "b": 60},
-                            "paper_bgcolor": "white",
-                            "plot_bgcolor": "white",
-                            "xaxis": {"title": "Hora" if title.endswith("diárias") else "Data"},
-                            "yaxis": {"title": "Vendas (R$)", "rangemode": "tozero"},
-                        },
-                        width="100%",
-                        height="26rem",
+                    report_chart_plot(
+                        SalesDashboardState.chart_data,
+                        period_feedback,
+                        height="min(32rem, 60vh)",
+                        xaxis_title="Dia" if is_weekly else "Horário",
+                        yaxis_title="Vendas (R$)",
+                        period=period,
                     ),
+                ),
+                rx.text(
+                    comparison_note,
+                    color="#64748B",
+                    font_size="0.78rem",
+                    line_height="1.5",
                 ),
                 width="100%",
                 align="stretch",
-                gap="1rem",
+                gap="1.25rem",
             ),
             width="100%",
-            max_width="62rem",
+            max_width="1440px",
             margin="0 auto",
-            padding="clamp(1.25rem, 2.5vw, 2rem)",
+            padding="clamp(1.25rem, 3vw, 2.5rem)",
             background="white",
             border_radius="1rem",
             box_shadow="0 10px 28px rgba(23, 32, 51, 0.08)",
         ),
         width="100%",
-        max_width="62rem",
+        max_width="1440px",
         margin="0 auto",
         align="stretch",
-        gap="1rem",
+        gap="1.25rem",
+    )
+
+
+def inventory_risk_chart_row(
+    product: Any,
+    index: Any,
+    value: Any,
+    *,
+    scale: int,
+) -> rx.Component:
+    color = report_stock_color(index)
+    if isinstance(value, (int, float)):
+        bar_width = f"{min(100, max(0, value * 100 / scale))}%"
+    else:
+        bar_width = (
+            rx.cond(value >= scale, 100, value * 100 / scale).to(str) + "%"
+        )
+    return rx.vstack(
+        rx.text(
+            value,
+            color="#475569",
+            font_size="0.78rem",
+            font_weight="600",
+            text_align="center",
+        ),
+        rx.box(
+            rx.box(
+                width="2.75rem",
+                height=bar_width,
+                border_radius="0.45rem 0.45rem 0 0",
+                background=color,
+            ),
+            width="100%",
+            height="10rem",
+            display="flex",
+            align_items="flex-end",
+            justify_content="center",
+            border_bottom="1px solid #DDE3EC",
+            background_image=(
+                "linear-gradient(to top, #E8EDF3 1px, transparent 1px)"
+            ),
+            background_size="100% 25%",
+        ),
+        rx.text(
+            product,
+            color=color,
+            font_size="0.72rem",
+            font_weight="600",
+            line_height="1.2",
+            text_align="center",
+            word_break="break-word",
+            title=product,
+        ),
+        width="100%",
+        min_width="0",
+        height="15rem",
+        align="center",
+        justify="end",
+        gap="0.5rem",
+    )
+
+
+def inventory_risk_chart(figure_data: Any, *, expiring: bool) -> rx.Component:
+    if expiring:
+        products = figure_data.to(dict[str, list[dict[str, list[str]]]])["data"][0]["y"]
+        values = figure_data.to(dict[str, list[dict[str, list[int]]]])["data"][0]["x"]
+        metric_label = "Dias para vencer"
+        scale = 15
+    else:
+        products = figure_data.to(dict[str, list[dict[str, list[str]]]])["data"][0]["x"]
+        values = figure_data.to(dict[str, list[dict[str, list[int]]]])["data"][0]["y"]
+        metric_label = "Quantidade em estoque"
+        scale = 10
+
+    return rx.vstack(
+        rx.text(
+            metric_label,
+            color="#64748B",
+            font_size="0.75rem",
+            font_weight="700",
+        ),
+        rx.grid(
+            rx.foreach(
+                products,
+                lambda product, index: inventory_risk_chart_row(
+                    product,
+                    index,
+                    values[index],
+                    scale=scale,
+                ),
+            ),
+            width="100%",
+            align="end",
+            gap="0.75rem",
+            grid_template_columns="repeat(auto-fit, minmax(7.5rem, 1fr))",
+            class_name="inventory-risk-chart",
+        ),
+        width="100%",
+        align="stretch",
+        gap="0.65rem",
+    )
+
+
+def inventory_risk_table_row(
+    product: Any,
+    quantity: Any,
+    days_to_expire: Any,
+    status: Any,
+    index: Any,
+) -> rx.Component:
+    return rx.table.row(
+        rx.table.row_header_cell(
+            product,
+            color="#334155",
+            font_weight="600",
+            padding="0.75rem",
+        ),
+        rx.table.cell(
+            quantity,
+            color="#475569",
+            text_align="right",
+            padding="0.75rem",
+        ),
+        rx.table.cell(
+            days_to_expire,
+            color="#475569",
+            text_align="right",
+            padding="0.75rem",
+        ),
+        rx.table.cell(
+            status,
+            color="#475569",
+            text_align="right",
+            padding="0.75rem",
+        ),
+        background=rx.cond(index % 2 == 0, "#F8FAFC", "white"),
+        border_bottom="1px solid #E8EDF3",
+    )
+
+
+def inventory_risk_table(figure_data: Any, *, expiring: bool) -> rx.Component:
+    if expiring:
+        products = figure_data.to(dict[str, list[dict[str, list[str]]]])["data"][0]["y"]
+        quantities = figure_data.to(dict[str, list[dict[str, list[int]]]])["data"][0]["customdata"]
+        days = figure_data.to(dict[str, list[dict[str, list[int]]]])["data"][0]["x"]
+        rows = rx.foreach(
+            products,
+            lambda product, index: inventory_risk_table_row(
+                product,
+                quantities[index],
+                days[index],
+                rx.cond(days[index] == 0, "Vence hoje", "Próximo do vencimento"),
+                index,
+            ),
+        )
+    else:
+        products = figure_data.to(dict[str, list[dict[str, list[str]]]])["data"][0]["x"]
+        quantities = figure_data.to(dict[str, list[dict[str, list[int]]]])["data"][0]["y"]
+        rows = rx.foreach(
+            products,
+            lambda product, index: inventory_risk_table_row(
+                product,
+                quantities[index],
+                "—",
+                rx.cond(quantities[index] == 0, "Sem estoque", "Estoque baixo"),
+                index,
+            ),
+        )
+
+    return rx.box(
+        rx.table.root(
+            rx.table.header(
+                rx.table.row(
+                    rx.table.column_header_cell(
+                        "Produto",
+                        color="#475569",
+                        font_weight="700",
+                        padding="0.75rem",
+                    ),
+                    rx.table.column_header_cell(
+                        "Quantidade em Estoque",
+                        color="#475569",
+                        font_weight="700",
+                        text_align="right",
+                        padding="0.75rem",
+                    ),
+                    rx.table.column_header_cell(
+                        "Dias para Vencer",
+                        color="#475569",
+                        font_weight="700",
+                        text_align="right",
+                        padding="0.75rem",
+                    ),
+                    rx.table.column_header_cell(
+                        "Status",
+                        color="#475569",
+                        font_weight="700",
+                        text_align="right",
+                        padding="0.75rem",
+                    ),
+                    border_bottom="2px solid #DDE3EC",
+                )
+            ),
+            rx.table.body(rows),
+            width="100%",
+            min_width="100%",
+            variant="ghost",
+        ),
+        width="100%",
     )
 
 
@@ -2743,40 +3741,32 @@ def inventory_dashboard_page(
     figure_data: Any,
     feedback: Any,
     *,
-    horizontal: bool = False,
+    expiring: bool = False,
 ) -> rx.Component:
     return rx.vstack(
         dashboard_home_button(),
         rx.card(
             rx.vstack(
-                rx.heading(title, size="5", color="#172033"),
-                rx.text(subtitle, color="#7A8496"),
+                rx.heading(
+                    "Análise de Risco: Estoque e Validade",
+                    size="5",
+                    color="#172033",
+                ),
+                rx.vstack(
+                    rx.heading(title, size="3", color="#334155"),
+                    rx.text(subtitle, color="#7A8496"),
+                    align="start",
+                    gap="0.2rem",
+                ),
                 rx.cond(
                     feedback != "",
                     rx.text(feedback, color="#B42318", role="alert"),
-                    rx.plotly(
-                        data=figure_data.to(Figure),
-                        layout={
-                            "autosize": True,
-                            "height": 480,
-                            "margin": {"l": 190 if horizontal else 50, "r": 30, "t": 24, "b": 70},
-                            "paper_bgcolor": "white",
-                            "plot_bgcolor": "white",
-                            "xaxis": {
-                                "title": (
-                                    "Dias até o vencimento"
-                                    if horizontal
-                                    else "Produto"
-                                ),
-                                "rangemode": "tozero",
-                            },
-                            "yaxis": {
-                                "title": "Produto" if horizontal else "Unidades disponíveis",
-                                "autorange": "reversed" if horizontal else True,
-                            },
-                        },
+                    rx.vstack(
+                        inventory_risk_chart(figure_data, expiring=expiring),
+                        inventory_risk_table(figure_data, expiring=expiring),
                         width="100%",
-                        height="30rem",
+                        align="stretch",
+                        gap="0.75rem",
                     ),
                 ),
                 width="100%",
@@ -3859,17 +4849,6 @@ def registration_form_panel() -> rx.Component:
                     width="100%",
                     gap="0.3rem",
                 ),
-<<<<<<< HEAD
-                rx.select(
-                    ["Proprietário", "Operador", "Admin"],
-                    name="role",
-                    placeholder="Digite a função do funcionário",
-                    aria_label="Digite a função do funcionário",
-                    value=AuthState.employee_form_role,
-                    on_change=AuthState.set_employee_form_role,
-                    justify_content="center",
-                    **input_style,
-=======
                 rx.vstack(
                     rx.text("E-mail do Funcionário", class_name="employee-form-label"),
                     rx.input(
@@ -3924,7 +4903,6 @@ def registration_form_panel() -> rx.Component:
                     align="start",
                     width="100%",
                     gap="0.3rem",
->>>>>>> cd88d7a (Melhorias visuais nas telas principais e no menu lateral do sistema)
                 ),
                 rx.button(
                     rx.hstack(
@@ -4771,14 +5749,19 @@ def dashboard_layout(
                 dashboard_header(subtitle=subtitle),
                 content_area,
                 width="100%",
-                max_width="70rem",
+                max_width="1440px",
                 margin="0 auto",
-                padding="clamp(2rem, 6vh, 4.5rem) clamp(1.25rem, 5vw, 5rem) 6rem",
-                gap="clamp(3rem, 8vh, 5.5rem)",
+                padding=[
+                    "1rem 1rem 6rem",
+                    "1.5rem 1.5rem 6rem",
+                    "2rem 2rem 6rem",
+                    "2.5rem 2.5rem 6rem",
+                ],
+                gap=["1.5rem", "2rem", "2.5rem", "3rem"],
                 align="stretch",
                 height="100%" if scroll_content else None,
                 min_height="0" if scroll_content else None,
-                box_sizing="border-box" if scroll_content else None,
+                box_sizing="border-box",
             ),
             rx.image(
                 src="/logo_bipsystem.png",
@@ -4813,7 +5796,7 @@ def dashboard_layout(
     )
 
 
-@rx.page(route="/", on_load=AuthState.require_admin)
+@rx.page(route="/", on_load=SalesDashboardState.load_report_sales)
 def index() -> rx.Component:
     return dashboard_layout(
         reports_cards(),
@@ -4845,7 +5828,7 @@ def data_proxima_page() -> rx.Component:
             "Lotes com validade entre hoje e os próximos 15 dias",
             ValidadeState.figura_grafico,
             ValidadeState.feedback,
-            horizontal=True,
+            expiring=True,
         ),
         active_destination="home",
         subtitle="Acompanhe os produtos próximos do vencimento",
@@ -4890,12 +5873,13 @@ def produtos_page() -> rx.Component:
     )
 
 
-@rx.page(route="/relatorios", on_load=AuthState.require_admin)
+@rx.page(route="/relatorios", on_load=SalesDashboardState.load_report_sales)
 def relatorios_page() -> rx.Component:
     return dashboard_layout(
         reports_cards(),
         active_destination="reports",
         subtitle="Aqui você pode acessar seus dashboards",
+        scroll_content=True,
     )
 
 
@@ -5423,16 +6407,11 @@ app = rx.App(
             "background": "#D9D9D9 !important",
         },
         ".conference-date-input input": {
-<<<<<<< HEAD
             "display": "flex !important",
             "justify_content": "center !important",
             "text_align": "center !important",
             "text_align_last": "center !important",
             "text_indent": "0 !important",
-=======
-            "text_align": "left !important",
-            "text_align_last": "left !important",
->>>>>>> cd88d7a (Melhorias visuais nas telas principais e no menu lateral do sistema)
         },
         ".conference-date-input::-webkit-datetime-edit, .conference-date-input input::-webkit-datetime-edit, .conference-date-input::-webkit-date-and-time-value, .conference-date-input input::-webkit-date-and-time-value": {
             "display": "flex",
